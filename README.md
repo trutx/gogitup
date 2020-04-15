@@ -47,4 +47,4 @@ The default configuration file is `~/.gogitup.yaml`, but you can specify any oth
 
 ## Installation
 
-To install, just `go get github.com/trutx/go/gogitup`
+To install, just `go get github.com/trutx/gogitup`
