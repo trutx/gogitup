@@ -1,0 +1,62 @@
+# Binary
+/gogitup
+
+# Libraries and executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+
+# Coverage file
+*.out
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.sublime-workspace
+*.sublime-project
+.project
+.classpath
+.settings/
+.history/
+.atom/
+.buildpath
+.directory
+.kdev4/
+*.kdev4
+.metadata
+.cache
+.project
+.settings
+.tmproj
+*.esproj
+nbproject/
+*.launch
+*.iml
+*.ipr
+*.iws
+.idea_modules/
+.vs/
+.vscode/
+__debug_bin
+.cursor/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db 

@@ -1,0 +1,10 @@
+# Sample configuration file for gogitup
+# Copy this file to ~/.gogitup.yaml and modify as needed
+
+# List of directories to scan for Git repositories
+directories:
+  - ~/repos
+  - ~/work/projects
+  - ~/go/src/github.com
+  # You can use environment variables
+  - ${GOPATH}/src/github.com 
