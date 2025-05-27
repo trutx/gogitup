@@ -3,6 +3,7 @@ package git
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -724,4 +725,404 @@ func TestFindRepositories_EdgeCases(t *testing.T) {
 func assertFileExists(t *testing.T, path string) {
 	_, err := os.Stat(path)
 	assert.NoError(t, err)
+}
+
+func TestRepository_isLFSRepository(t *testing.T) {
+	tests := []struct {
+		name          string
+		gitattributes string
+		expectUsesLFS bool
+	}{
+		{
+			name:          "no gitattributes file",
+			expectUsesLFS: false,
+		},
+		{
+			name:          "empty gitattributes file",
+			gitattributes: "",
+			expectUsesLFS: false,
+		},
+		{
+			name:          "gitattributes without LFS",
+			gitattributes: "*.txt text=auto\n*.sh text eol=lf\n",
+			expectUsesLFS: false,
+		},
+		{
+			name:          "gitattributes with LFS",
+			gitattributes: "*.bin filter=lfs diff=lfs merge=lfs -text\n*.txt text=auto\n",
+			expectUsesLFS: true,
+		},
+		{
+			name:          "gitattributes with only LFS filter",
+			gitattributes: "*.data filter=lfs\n",
+			expectUsesLFS: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create temporary directory for test
+			dir, err := os.MkdirTemp("", "gogitup-test-lfs-*")
+			require.NoError(t, err)
+			defer func() {
+				if err := os.RemoveAll(dir); err != nil {
+					t.Errorf("Failed to remove temp directory: %v", err)
+				}
+			}()
+
+			// Initialize git repository
+			repo, err := git.PlainInit(dir, false)
+			require.NoError(t, err)
+
+			// Create .gitattributes file if content is provided
+			if tt.gitattributes != "" {
+				err = os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte(tt.gitattributes), 0644)
+				require.NoError(t, err)
+			}
+
+			// Create repository instance
+			r := &Repository{
+				Path: dir,
+				repo: repo,
+			}
+
+			// Test LFS detection
+			assert.Equal(t, tt.expectUsesLFS, r.isLFSRepository())
+		})
+	}
+}
+
+func TestRepository_UpdateLFS(t *testing.T) {
+	if os.Getenv("SKIP_GIT_LFS_TESTS") != "" {
+		t.Skip("Skipping Git LFS tests (SKIP_GIT_LFS_TESTS is set)")
+	}
+
+	// Check if git-lfs is installed
+	if _, err := exec.LookPath("git-lfs"); err != nil {
+		t.Skip("git-lfs is not installed")
+	}
+
+	tests := []struct {
+		name           string
+		setupRepo      func(t *testing.T, dir string) error
+		modifyRepo     func(t *testing.T, dir string) error
+		hasUpstream    bool
+		expectError    bool
+		expectDiffStat bool
+	}{
+		{
+			name: "clean LFS repository",
+			setupRepo: func(t *testing.T, dir string) error {
+				// Create a bare repository for origin
+				originDir := dir + "-origin"
+				if err := os.MkdirAll(originDir, 0755); err != nil {
+					return err
+				}
+				cmd := exec.Command("git", "init", "--bare")
+				cmd.Dir = originDir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Initialize git repository
+				cmd = exec.Command("git", "init")
+				cmd.Dir = dir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Initialize LFS
+				cmd = exec.Command("git", "lfs", "install")
+				cmd.Dir = dir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Create .gitattributes
+				if err := os.WriteFile(filepath.Join(dir, ".gitattributes"),
+					[]byte("*.bin filter=lfs diff=lfs merge=lfs -text\n"), 0644); err != nil {
+					return err
+				}
+
+				// Create and track a binary file
+				if err := os.WriteFile(filepath.Join(dir, "test.bin"), []byte{0, 1, 2, 3}, 0644); err != nil {
+					return err
+				}
+
+				// Add and commit
+				cmds := [][]string{
+					{"config", "user.name", "Test User"},
+					{"config", "user.email", "test@example.com"},
+					{"add", ".gitattributes"},
+					{"add", "test.bin"},
+					{"commit", "-m", "Initial commit with LFS"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if err := cmd.Run(); err != nil {
+						return err
+					}
+				}
+
+				// Add origin remote and push
+				cmds = [][]string{
+					{"remote", "add", "origin", originDir},
+					{"push", "-u", "origin", "main"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if err := cmd.Run(); err != nil {
+						return err
+					}
+				}
+
+				return nil
+			},
+			expectError:    false,
+			expectDiffStat: false,
+		},
+		{
+			name: "LFS repository with changes",
+			setupRepo: func(t *testing.T, dir string) error {
+				// Create a bare repository for origin
+				originDir := dir + "-origin"
+				if err := os.MkdirAll(originDir, 0755); err != nil {
+					return err
+				}
+				cmd := exec.Command("git", "init", "--bare")
+				cmd.Dir = originDir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Initialize git repository
+				cmd = exec.Command("git", "init")
+				cmd.Dir = dir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Initialize LFS
+				cmd = exec.Command("git", "lfs", "install")
+				cmd.Dir = dir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Create .gitattributes
+				if err := os.WriteFile(filepath.Join(dir, ".gitattributes"),
+					[]byte("*.bin filter=lfs diff=lfs merge=lfs -text\n"), 0644); err != nil {
+					return err
+				}
+
+				// Create and track a binary file
+				if err := os.WriteFile(filepath.Join(dir, "test.bin"), []byte{0, 1, 2, 3}, 0644); err != nil {
+					return err
+				}
+
+				// Add and commit
+				cmds := [][]string{
+					{"config", "user.name", "Test User"},
+					{"config", "user.email", "test@example.com"},
+					{"add", ".gitattributes"},
+					{"add", "test.bin"},
+					{"commit", "-m", "Initial commit with LFS"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if err := cmd.Run(); err != nil {
+						return err
+					}
+				}
+
+				// Add origin remote and push
+				cmds = [][]string{
+					{"remote", "add", "origin", originDir},
+					{"push", "-u", "origin", "main"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if err := cmd.Run(); err != nil {
+						return err
+					}
+				}
+
+				// Create a new binary file in a clone
+				cloneDir := dir + "-clone"
+				cmd = exec.Command("git", "clone", originDir, cloneDir)
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+				defer func() {
+					if err := os.RemoveAll(cloneDir); err != nil {
+						t.Errorf("Failed to remove clone directory: %v", err)
+					}
+				}()
+
+				// Initialize LFS in clone
+				cmd = exec.Command("git", "lfs", "install")
+				cmd.Dir = cloneDir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Create and commit a new file
+				if err := os.WriteFile(filepath.Join(cloneDir, "new.bin"), []byte{4, 5, 6, 7}, 0644); err != nil {
+					return err
+				}
+
+				cmds = [][]string{
+					{"config", "user.name", "Test User"},
+					{"config", "user.email", "test@example.com"},
+					{"add", "new.bin"},
+					{"commit", "-m", "Add new binary file"},
+					{"push", "origin", "main"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = cloneDir
+					if err := cmd.Run(); err != nil {
+						return err
+					}
+				}
+
+				return nil
+			},
+			expectError:    false,
+			expectDiffStat: true,
+		},
+		{
+			name: "LFS repository with unstaged changes",
+			setupRepo: func(t *testing.T, dir string) error {
+				// Create a bare repository for origin
+				originDir := dir + "-origin"
+				if err := os.MkdirAll(originDir, 0755); err != nil {
+					return err
+				}
+				cmd := exec.Command("git", "init", "--bare")
+				cmd.Dir = originDir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Initialize git repository
+				cmd = exec.Command("git", "init")
+				cmd.Dir = dir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Initialize LFS
+				cmd = exec.Command("git", "lfs", "install")
+				cmd.Dir = dir
+				if err := cmd.Run(); err != nil {
+					return err
+				}
+
+				// Create .gitattributes
+				if err := os.WriteFile(filepath.Join(dir, ".gitattributes"),
+					[]byte("*.bin filter=lfs diff=lfs merge=lfs -text\n"), 0644); err != nil {
+					return err
+				}
+
+				// Add and commit
+				cmds := [][]string{
+					{"config", "user.name", "Test User"},
+					{"config", "user.email", "test@example.com"},
+					{"add", ".gitattributes"},
+					{"commit", "-m", "Initial commit with LFS"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if err := cmd.Run(); err != nil {
+						return err
+					}
+				}
+
+				// Add origin remote and push
+				cmds = [][]string{
+					{"remote", "add", "origin", originDir},
+					{"push", "-u", "origin", "main"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if err := cmd.Run(); err != nil {
+						return err
+					}
+				}
+
+				return nil
+			},
+			modifyRepo: func(t *testing.T, dir string) error {
+				// Create an unstaged file
+				return os.WriteFile(filepath.Join(dir, "unstaged.bin"), []byte{8, 9, 10, 11}, 0644)
+			},
+			expectError:    true,
+			expectDiffStat: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create temporary directory for test
+			dir, err := os.MkdirTemp("", "gogitup-test-lfs-*")
+			require.NoError(t, err)
+			defer func() {
+				if err := os.RemoveAll(dir); err != nil {
+					t.Errorf("Failed to remove temp directory: %v", err)
+				}
+				if err := os.RemoveAll(dir + "-origin"); err != nil {
+					t.Errorf("Failed to remove origin directory: %v", err)
+				}
+				if err := os.RemoveAll(dir + "-clone"); err != nil {
+					t.Errorf("Failed to remove clone directory: %v", err)
+				}
+			}()
+
+			// Set up test repository
+			if tt.setupRepo != nil {
+				err = tt.setupRepo(t, dir)
+				require.NoError(t, err)
+			}
+
+			// Create repository instance
+			repo, err := git.PlainOpen(dir)
+			require.NoError(t, err)
+			r := &Repository{
+				Path:        dir,
+				repo:        repo,
+				HasUpstream: tt.hasUpstream,
+			}
+
+			// Modify repository if needed
+			if tt.modifyRepo != nil {
+				err = tt.modifyRepo(t, dir)
+				require.NoError(t, err)
+			}
+
+			// Test update
+			err = r.Update()
+			if tt.expectError {
+				assert.Error(t, err)
+				if tt.expectError {
+					assert.ErrorIs(t, err, ErrUnstagedChanges)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+
+			// Check diff stats
+			if tt.expectDiffStat {
+				assert.NotEmpty(t, r.DiffStats)
+			} else {
+				assert.Empty(t, r.DiffStats)
+			}
+		})
+	}
 }

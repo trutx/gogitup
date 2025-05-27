@@ -9,14 +9,18 @@ GoGitUp is a command-line tool that helps you manage and update multiple Git rep
 - ⚡ Fast repository discovery and caching
 - 🔒 GitHub token support for private repositories
 - 🔱 Support for fork workflow (origin/upstream remotes)
+- 📦 Native Git LFS support for large file repositories
 - 💾 Cache repository information for faster subsequent runs
 - 🚫 Skip repositories with unstaged changes
 
 ## Installation
 
-### From Source
+### Prerequisites
 
-Requires Go 1.21 or later.
+- Go 1.21 or later
+- Git LFS (optional, required only for LFS repositories)
+
+### From Source
 
 ```bash
 go install github.com/trutx/gogitup/cmd/gogitup@latest
@@ -86,6 +90,16 @@ gogitup update --stat
 # Show verbose output
 gogitup update -v
 ```
+
+#### Git LFS Support
+
+GoGitUp automatically detects repositories that use Git Large File Storage (LFS) and handles them appropriately:
+- Automatically identifies LFS repositories through `.gitattributes`
+- Uses native Git commands for LFS operations
+- Maintains proper LFS pointer files and object storage
+- Shows correct diff statistics for LFS files
+
+Note: Git LFS must be installed on your system to handle LFS repositories.
 
 ### Cache Management
 

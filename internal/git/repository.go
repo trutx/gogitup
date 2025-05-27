@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -230,17 +231,20 @@ func getTerminalWidth() int {
 }
 
 // formatDiffStat formats a single diff stat line with proper width constraints
-func formatDiffStat(path string, added, removed int, graphWidth int, green, red func(string) string) string {
+func formatDiffStat(path string, added, removed int, maxPathLen int, maxNumLen int, termWidth int, green, red func(string) string) string {
+	// Calculate available space for the graph part
+	// Format: " path | NNN graph"
+	// 1 space + path + 1 space + | + 1 space + NNN + 1 space + graph
+	graphWidth := termWidth - maxPathLen - maxNumLen - 5
+
 	// Calculate the graph part
 	total := added + removed
 	graph := ""
 	if graphWidth > 0 {
 		// Scale the number of symbols to fit the graph width
-		symbolCount := graphWidth
-		if total > graphWidth {
+		symbolCount := total
+		if symbolCount > graphWidth {
 			symbolCount = graphWidth
-		} else if total < graphWidth {
-			symbolCount = total
 		}
 
 		// Calculate proportions of + and - symbols
@@ -254,15 +258,119 @@ func formatDiffStat(path string, added, removed int, graphWidth int, green, red 
 		graph = green(strings.Repeat("+", plusCount)) + red(strings.Repeat("-", minusCount))
 	}
 
-	return fmt.Sprintf(" %s | %2d %s",
+	return fmt.Sprintf(" %-*s | %*d %s",
+		maxPathLen,
 		path,
+		maxNumLen,
 		total,
 		graph,
 	)
 }
 
+// isLFSRepository checks if the repository uses Git LFS by looking for .gitattributes with LFS entries
+func (r *Repository) isLFSRepository() bool {
+	// Check .gitattributes file
+	gitattributes := filepath.Join(r.Path, ".gitattributes")
+	data, err := os.ReadFile(gitattributes)
+	if err != nil {
+		return false
+	}
+
+	// Look for LFS patterns (e.g., "*.bin filter=lfs diff=lfs merge=lfs")
+	return strings.Contains(string(data), "filter=lfs")
+}
+
+// runGitCommand executes a git command in the repository directory
+func (r *Repository) runGitCommand(args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = r.Path
+	cmd.Env = os.Environ()
+
+	// If this is a GitHub repository and GITHUB_TOKEN is set, use it
+	if strings.Contains(r.Path, "github.com") {
+		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("GIT_ASKPASS=%s", os.DevNull))
+			cmd.Env = append(cmd.Env, "GIT_USERNAME=git")
+			cmd.Env = append(cmd.Env, fmt.Sprintf("GIT_PASSWORD=%s", token))
+		}
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("git command failed: %s: %w", string(output), err)
+	}
+	return nil
+}
+
+// updateLFSRepository updates an LFS-enabled repository using native git commands
+func (r *Repository) updateLFSRepository() error {
+	// Get current branch
+	head, err := r.repo.Head()
+	if err != nil {
+		return fmt.Errorf("failed to get HEAD: %w", err)
+	}
+
+	// Check for unstaged changes
+	cmd := exec.Command("git", "status", "--porcelain")
+	cmd.Dir = r.Path
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to check for unstaged changes: %w", err)
+	}
+	if len(output) > 0 {
+		return ErrUnstagedChanges
+	}
+
+	// Store the current HEAD for diff stats
+	cmd = exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = r.Path
+	oldHead, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get current HEAD: %w", err)
+	}
+	oldHeadStr := strings.TrimSpace(string(oldHead))
+
+	if r.HasUpstream {
+		// Fetch from upstream
+		if err := r.runGitCommand("fetch", "upstream"); err != nil {
+			return fmt.Errorf("failed to fetch from upstream: %w", err)
+		}
+
+		// Merge upstream changes
+		if err := r.runGitCommand("merge", "--ff-only", "upstream/"+head.Name().Short()); err != nil {
+			return fmt.Errorf("failed to merge upstream changes: %w", err)
+		}
+	} else {
+		// Fetch from origin
+		if err := r.runGitCommand("fetch", "origin"); err != nil {
+			return fmt.Errorf("failed to fetch from origin: %w", err)
+		}
+
+		// Fast-forward to origin
+		if err := r.runGitCommand("merge", "--ff-only", "origin/"+head.Name().Short()); err != nil {
+			return fmt.Errorf("failed to merge origin changes: %w", err)
+		}
+	}
+
+	// Get diff stats
+	cmd = exec.Command("git", "diff", "--stat", oldHeadStr+"..HEAD")
+	cmd.Dir = r.Path
+	stats, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get diff stats: %w", err)
+	}
+	r.DiffStats = string(stats)
+
+	return nil
+}
+
 // Update updates the repository by fetching and pulling changes
 func (r *Repository) Update() error {
+	// Check if this is an LFS repository
+	if r.isLFSRepository() {
+		return r.updateLFSRepository()
+	}
+
 	// Get worktree and check for unstaged changes first
 	w, err := r.repo.Worktree()
 	if err != nil {
@@ -363,26 +471,23 @@ func (r *Repository) Update() error {
 			var statLines []string
 			var totalAdded, totalRemoved int
 
-			// Get terminal width and calculate layout
+			// Get terminal width
 			termWidth := getTerminalWidth()
-			const (
-				minGraphWidth  = 10
-				separatorWidth = 5 // space + pipe + space + number + space
-			)
 
-			// Find the longest path
+			// Find the longest path and the maximum number width
 			maxPathLen := 0
-			for path := range stats {
+			maxTotal := 0
+			for path, stat := range stats {
 				if len(path) > maxPathLen {
 					maxPathLen = len(path)
 				}
+				if total := stat.added + stat.removed; total > maxTotal {
+					maxTotal = total
+				}
 			}
 
-			// Calculate graph width with remaining space
-			graphWidth := termWidth - maxPathLen - separatorWidth
-			if graphWidth < minGraphWidth {
-				graphWidth = minGraphWidth
-			}
+			// Calculate the width needed for the number
+			maxNumLen := len(fmt.Sprintf("%d", maxTotal))
 
 			green := color.New(color.FgGreen).SprintfFunc()
 			red := color.New(color.FgRed).SprintfFunc()
@@ -395,7 +500,9 @@ func (r *Repository) Update() error {
 					path,
 					stat.added,
 					stat.removed,
-					graphWidth,
+					maxPathLen,
+					maxNumLen,
+					termWidth,
 					func(s string) string { return green("%s", s) },
 					func(s string) string { return red("%s", s) },
 				))
