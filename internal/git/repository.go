@@ -22,7 +22,7 @@ import (
 
 // Common errors
 var (
-	ErrUnstagedChanges = fmt.Errorf("worktree contains unstaged changes")
+	ErrUncommittedChanges = fmt.Errorf("worktree contains uncommitted changes to tracked files")
 )
 
 // Repository represents a Git repository
@@ -304,29 +304,57 @@ func (r *Repository) runGitCommand(args ...string) error {
 
 // updateLFSRepository updates an LFS-enabled repository using native git commands
 func (r *Repository) updateLFSRepository() error {
+	// Check if git-lfs is installed
+	if _, err := exec.LookPath("git-lfs"); err != nil {
+		return fmt.Errorf("git-lfs is not installed: %w", err)
+	}
+
 	// Get current branch
 	head, err := r.repo.Head()
 	if err != nil {
 		return fmt.Errorf("failed to get HEAD: %w", err)
 	}
 
-	// Check for unstaged changes
-	cmd := exec.Command("git", "status", "--porcelain")
+	// Check for uncommitted changes to tracked files only
+	// First, get the list of tracked files
+	cmd := exec.Command("git", "ls-files")
 	cmd.Dir = r.Path
-	output, err := cmd.Output()
+	trackedFiles, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to check for unstaged changes: %w", err)
+		return fmt.Errorf("failed to get tracked files: %s: %w", string(trackedFiles), err)
 	}
-	if len(output) > 0 {
-		return ErrUnstagedChanges
+
+	// If there are no tracked files, we can proceed with the update
+	if len(strings.TrimSpace(string(trackedFiles))) == 0 {
+		return nil
+	}
+
+	// Check for staged changes to tracked files
+	cmd = exec.Command("git", "diff-index", "--quiet", "HEAD", "--")
+	cmd.Dir = r.Path
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return ErrUncommittedChanges
+		}
+		return fmt.Errorf("failed to check staged changes: %s: %w", string(out), err)
+	}
+
+	// Check for unstaged changes to tracked files
+	cmd = exec.Command("git", "diff-files", "--quiet", "--")
+	cmd.Dir = r.Path
+	if out, err := cmd.CombinedOutput(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return ErrUncommittedChanges
+		}
+		return fmt.Errorf("failed to check unstaged changes: %s: %w", string(out), err)
 	}
 
 	// Store the current HEAD for diff stats
 	cmd = exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = r.Path
-	oldHead, err := cmd.Output()
+	oldHead, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to get current HEAD: %w", err)
+		return fmt.Errorf("failed to get current HEAD: %s: %w", string(oldHead), err)
 	}
 	oldHeadStr := strings.TrimSpace(string(oldHead))
 
@@ -355,9 +383,15 @@ func (r *Repository) updateLFSRepository() error {
 	// Get diff stats
 	cmd = exec.Command("git", "diff", "--stat", oldHeadStr+"..HEAD")
 	cmd.Dir = r.Path
-	stats, err := cmd.Output()
+	stats, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to get diff stats: %w", err)
+		// If the diff command fails, try using git show instead
+		cmd = exec.Command("git", "show", "--stat", "HEAD")
+		cmd.Dir = r.Path
+		stats, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to get diff stats: %s: %w", string(stats), err)
+		}
 	}
 	r.DiffStats = string(stats)
 
@@ -377,13 +411,19 @@ func (r *Repository) Update() error {
 		return fmt.Errorf("failed to get worktree: %w", err)
 	}
 
-	// Check for unstaged changes before any operations
+	// Check for uncommitted changes to tracked files
 	status, err := w.Status()
 	if err != nil {
 		return fmt.Errorf("failed to get worktree status: %w", err)
 	}
-	if !status.IsClean() {
-		return ErrUnstagedChanges
+
+	// Check only tracked files for changes
+	for _, fileStatus := range status {
+		if fileStatus.Staging != git.Untracked && fileStatus.Worktree != git.Untracked {
+			if fileStatus.Staging != git.Unmodified || fileStatus.Worktree != git.Unmodified {
+				return ErrUncommittedChanges
+			}
+		}
 	}
 
 	// Get current HEAD for diff comparison
@@ -556,7 +596,7 @@ func (r *Repository) updateOrigin() error {
 			return nil
 		}
 		if err == git.ErrUnstagedChanges {
-			return ErrUnstagedChanges
+			return ErrUncommittedChanges
 		}
 		if err == transport.ErrAuthenticationRequired {
 			return fmt.Errorf("authentication required: set GITHUB_TOKEN environment variable for GitHub repositories")

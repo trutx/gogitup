@@ -2,10 +2,12 @@ package git
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -133,6 +135,13 @@ func setupTestRepoWithRemotes(t *testing.T) (string, string, string, func()) {
 	_, err = git.PlainInit(originDir, true)
 	require.NoError(t, err)
 	t.Log("Initialized bare origin repository")
+
+	// Set default branch name for the bare repo
+	cmd := exec.Command("git", "config", "--local", "init.defaultBranch", "main")
+	cmd.Dir = originDir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to set default branch: %s: %v", string(out), err)
+	}
 
 	// Clone upstream to local
 	repo, err := git.PlainClone(localDir, false, &git.CloneOptions{
@@ -271,9 +280,9 @@ func TestRepository_Update(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "unstaged changes",
+			name: "uncommitted changes to tracked file",
 			setupRepo: func(t *testing.T) (*Repository, func()) {
-				t.Log("Setting up unstaged changes test")
+				t.Log("Setting up repository with uncommitted changes")
 				dir, cleanup := setupTestRepo(t)
 				repo, err := git.PlainOpen(dir)
 				require.NoError(t, err)
@@ -281,14 +290,33 @@ func TestRepository_Update(t *testing.T) {
 				return &Repository{Path: dir, repo: repo}, cleanup
 			},
 			modifyRepo: func(t *testing.T, repo *Repository) {
-				t.Log("Creating unstaged changes")
-				// Create a new file to cause unstaged changes
-				err := os.WriteFile(filepath.Join(repo.Path, "unstaged.txt"), []byte("unstaged content"), 0644)
+				t.Log("Creating uncommitted changes")
+				// Modify the existing test.txt file to create uncommitted changes
+				err := os.WriteFile(filepath.Join(repo.Path, "test.txt"), []byte("modified content"), 0644)
 				require.NoError(t, err)
-				t.Log("Created unstaged file: unstaged.txt")
+				t.Log("Modified tracked file: test.txt")
 			},
 			wantErr:     true,
-			wantErrType: ErrUnstagedChanges,
+			wantErrType: ErrUncommittedChanges,
+		},
+		{
+			name: "untracked files only",
+			setupRepo: func(t *testing.T) (*Repository, func()) {
+				t.Log("Setting up untracked files test")
+				dir, cleanup := setupTestRepo(t)
+				repo, err := git.PlainOpen(dir)
+				require.NoError(t, err)
+				t.Logf("Created test repository at %s", dir)
+				return &Repository{Path: dir, repo: repo}, cleanup
+			},
+			modifyRepo: func(t *testing.T, repo *Repository) {
+				t.Log("Creating untracked file")
+				// Create a new untracked file
+				err := os.WriteFile(filepath.Join(repo.Path, "untracked.txt"), []byte("untracked content"), 0644)
+				require.NoError(t, err)
+				t.Log("Created untracked file: untracked.txt")
+			},
+			wantErr: false,
 		},
 		{
 			name: "with upstream remote",
@@ -417,17 +445,17 @@ func TestRepository_Update_Errors(t *testing.T) {
 			expectError: "reference not found",
 		},
 		{
-			name: "unstaged changes",
+			name: "uncommitted changes",
 			setup: func(t *testing.T) (*Repository, func()) {
 				dir, cleanup := setupTestRepo(t)
 				repo, err := git.PlainOpen(dir)
 				require.NoError(t, err)
-				// Create unstaged file
-				err = os.WriteFile(filepath.Join(dir, "unstaged.txt"), []byte("unstaged"), 0644)
+				// Modify tracked file
+				err = os.WriteFile(filepath.Join(dir, "test.txt"), []byte("modified content"), 0644)
 				require.NoError(t, err)
 				return &Repository{Path: dir, repo: repo}, cleanup
 			},
-			expectError: "worktree contains unstaged changes",
+			expectError: "worktree contains uncommitted changes to tracked files",
 		},
 		{
 			name: "authentication required",
@@ -792,6 +820,28 @@ func TestRepository_isLFSRepository(t *testing.T) {
 	}
 }
 
+// Add this helper function before TestRepository_UpdateLFS
+func getDefaultBranch(t *testing.T, dir string) string {
+	t.Helper()
+	// Try to get the default branch from git config
+	cmd := exec.Command("git", "config", "--get", "init.defaultBranch")
+	cmd.Dir = dir
+	out, err := cmd.Output()
+	if err == nil && len(out) > 0 {
+		return strings.TrimSpace(string(out))
+	}
+	// Fallback to checking if we're on main or master
+	for _, branch := range []string{"main", "master"} {
+		cmd := exec.Command("git", "rev-parse", "--verify", branch)
+		cmd.Dir = dir
+		if err := cmd.Run(); err == nil {
+			return branch
+		}
+	}
+	// Default to main if nothing else is found
+	return "main"
+}
+
 func TestRepository_UpdateLFS(t *testing.T) {
 	if os.Getenv("SKIP_GIT_LFS_TESTS") != "" {
 		t.Skip("Skipping Git LFS tests (SKIP_GIT_LFS_TESTS is set)")
@@ -820,22 +870,23 @@ func TestRepository_UpdateLFS(t *testing.T) {
 				}
 				cmd := exec.Command("git", "init", "--bare")
 				cmd.Dir = originDir
-				if err := cmd.Run(); err != nil {
-					return err
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to init bare repo: %s: %w", string(out), err)
 				}
 
-				// Initialize git repository
-				cmd = exec.Command("git", "init")
+				// Initialize git repository with detected default branch
+				defaultBranch := getDefaultBranch(t, originDir)
+				cmd = exec.Command("git", "init", "-b", defaultBranch)
 				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					return err
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to init repo: %s: %w", string(out), err)
 				}
 
 				// Initialize LFS
 				cmd = exec.Command("git", "lfs", "install")
 				cmd.Dir = dir
-				if err := cmd.Run(); err != nil {
-					return err
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to install LFS: %s: %w", string(out), err)
 				}
 
 				// Create .gitattributes
@@ -868,13 +919,13 @@ func TestRepository_UpdateLFS(t *testing.T) {
 				// Add origin remote and push
 				cmds = [][]string{
 					{"remote", "add", "origin", originDir},
-					{"push", "-u", "origin", "main"},
+					{"push", "-u", "origin", defaultBranch},
 				}
 				for _, args := range cmds {
 					cmd := exec.Command("git", args...)
 					cmd.Dir = dir
-					if err := cmd.Run(); err != nil {
-						return err
+					if out, err := cmd.CombinedOutput(); err != nil {
+						return fmt.Errorf("failed to run git %s: %s: %w", strings.Join(args, " "), string(out), err)
 					}
 				}
 
@@ -889,6 +940,135 @@ func TestRepository_UpdateLFS(t *testing.T) {
 				// Create a bare repository for origin
 				originDir := dir + "-origin"
 				if err := os.MkdirAll(originDir, 0755); err != nil {
+					return fmt.Errorf("failed to create origin dir: %w", err)
+				}
+				cmd := exec.Command("git", "init", "--bare")
+				cmd.Dir = originDir
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to init bare repo: %s: %w", string(out), err)
+				}
+
+				// Initialize git repository with detected default branch
+				defaultBranch := getDefaultBranch(t, originDir)
+				cmd = exec.Command("git", "init", "-b", defaultBranch)
+				cmd.Dir = dir
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to init repo: %s: %w", string(out), err)
+				}
+
+				// Initialize LFS
+				cmd = exec.Command("git", "lfs", "install")
+				cmd.Dir = dir
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to install LFS: %s: %w", string(out), err)
+				}
+
+				// Create .gitattributes
+				if err := os.WriteFile(filepath.Join(dir, ".gitattributes"),
+					[]byte("*.bin filter=lfs diff=lfs merge=lfs -text\n"), 0644); err != nil {
+					return fmt.Errorf("failed to write .gitattributes: %w", err)
+				}
+
+				// Create and track a binary file
+				if err := os.WriteFile(filepath.Join(dir, "test.bin"), []byte{0, 1, 2, 3}, 0644); err != nil {
+					return fmt.Errorf("failed to write test.bin: %w", err)
+				}
+
+				// Add and commit
+				cmds := [][]string{
+					{"config", "user.name", "Test User"},
+					{"config", "user.email", "test@example.com"},
+					{"add", ".gitattributes"},
+					{"add", "test.bin"},
+					{"commit", "-m", "Initial commit with LFS"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if out, err := cmd.CombinedOutput(); err != nil {
+						return fmt.Errorf("failed to run git %s: %s: %w", strings.Join(args, " "), string(out), err)
+					}
+				}
+
+				// Add origin remote and push
+				cmds = [][]string{
+					{"remote", "add", "origin", originDir},
+					{"push", "-u", "origin", defaultBranch},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = dir
+					if out, err := cmd.CombinedOutput(); err != nil {
+						return fmt.Errorf("failed to run git %s: %s: %w", strings.Join(args, " "), string(out), err)
+					}
+				}
+
+				// Create a new binary file in a clone
+				cloneDir := dir + "-clone"
+				cmd = exec.Command("git", "clone", originDir, cloneDir)
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to clone repo: %s: %w", string(out), err)
+				}
+				defer func() {
+					if err := os.RemoveAll(cloneDir); err != nil {
+						t.Errorf("Failed to remove clone directory: %v", err)
+					}
+				}()
+
+				// Get the default branch name from the origin
+				defaultBranch = getDefaultBranch(t, originDir)
+
+				// Ensure we're on the correct branch
+				cmd = exec.Command("git", "checkout", defaultBranch)
+				cmd.Dir = cloneDir
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return fmt.Errorf("failed to checkout branch: %s: %w", string(out), err)
+				}
+
+				// Initialize LFS in clone and set up git config
+				cmds = [][]string{
+					{"lfs", "install"},
+					{"config", "user.name", "Test User"},
+					{"config", "user.email", "test@example.com"},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = cloneDir
+					if out, err := cmd.CombinedOutput(); err != nil {
+						return fmt.Errorf("failed to run git %s: %s: %w", strings.Join(args, " "), string(out), err)
+					}
+				}
+
+				// Create and commit a new file
+				if err := os.WriteFile(filepath.Join(cloneDir, "new.bin"), []byte{4, 5, 6, 7}, 0644); err != nil {
+					return fmt.Errorf("failed to write new.bin: %w", err)
+				}
+
+				// Add and commit the new file
+				cmds = [][]string{
+					{"add", "new.bin"},
+					{"commit", "-m", "Add new binary file"},
+					{"push", "origin", defaultBranch},
+				}
+				for _, args := range cmds {
+					cmd := exec.Command("git", args...)
+					cmd.Dir = cloneDir
+					if out, err := cmd.CombinedOutput(); err != nil {
+						return fmt.Errorf("failed to run git %s: %s: %w", strings.Join(args, " "), string(out), err)
+					}
+				}
+
+				return nil
+			},
+			expectError:    false,
+			expectDiffStat: true,
+		},
+		{
+			name: "LFS repository with uncommitted changes to tracked file",
+			setupRepo: func(t *testing.T, dir string) error {
+				// Create a bare repository for origin
+				originDir := dir + "-origin"
+				if err := os.MkdirAll(originDir, 0755); err != nil {
 					return err
 				}
 				cmd := exec.Command("git", "init", "--bare")
@@ -897,8 +1077,9 @@ func TestRepository_UpdateLFS(t *testing.T) {
 					return err
 				}
 
-				// Initialize git repository
-				cmd = exec.Command("git", "init")
+				// Initialize git repository with detected default branch
+				defaultBranch := getDefaultBranch(t, dir)
+				cmd = exec.Command("git", "init", "-b", defaultBranch)
 				cmd.Dir = dir
 				if err := cmd.Run(); err != nil {
 					return err
@@ -941,7 +1122,7 @@ func TestRepository_UpdateLFS(t *testing.T) {
 				// Add origin remote and push
 				cmds = [][]string{
 					{"remote", "add", "origin", originDir},
-					{"push", "-u", "origin", "main"},
+					{"push", "-u", "origin", defaultBranch},
 				}
 				for _, args := range cmds {
 					cmd := exec.Command("git", args...)
@@ -951,52 +1132,20 @@ func TestRepository_UpdateLFS(t *testing.T) {
 					}
 				}
 
-				// Create a new binary file in a clone
-				cloneDir := dir + "-clone"
-				cmd = exec.Command("git", "clone", originDir, cloneDir)
-				if err := cmd.Run(); err != nil {
-					return err
-				}
-				defer func() {
-					if err := os.RemoveAll(cloneDir); err != nil {
-						t.Errorf("Failed to remove clone directory: %v", err)
-					}
-				}()
-
-				// Initialize LFS in clone
-				cmd = exec.Command("git", "lfs", "install")
-				cmd.Dir = cloneDir
-				if err := cmd.Run(); err != nil {
-					return err
-				}
-
-				// Create and commit a new file
-				if err := os.WriteFile(filepath.Join(cloneDir, "new.bin"), []byte{4, 5, 6, 7}, 0644); err != nil {
-					return err
-				}
-
-				cmds = [][]string{
-					{"config", "user.name", "Test User"},
-					{"config", "user.email", "test@example.com"},
-					{"add", "new.bin"},
-					{"commit", "-m", "Add new binary file"},
-					{"push", "origin", "main"},
-				}
-				for _, args := range cmds {
-					cmd := exec.Command("git", args...)
-					cmd.Dir = cloneDir
-					if err := cmd.Run(); err != nil {
-						return err
-					}
-				}
-
 				return nil
 			},
-			expectError:    false,
-			expectDiffStat: true,
+			modifyRepo: func(t *testing.T, dir string) error {
+				// Modify the binary file
+				if err := os.WriteFile(filepath.Join(dir, "test.bin"), []byte{8, 9, 10, 11}, 0644); err != nil {
+					return err
+				}
+				return nil
+			},
+			expectError:    true,
+			expectDiffStat: false,
 		},
 		{
-			name: "LFS repository with unstaged changes",
+			name: "LFS repository with untracked files only",
 			setupRepo: func(t *testing.T, dir string) error {
 				// Create a bare repository for origin
 				originDir := dir + "-origin"
@@ -1009,8 +1158,9 @@ func TestRepository_UpdateLFS(t *testing.T) {
 					return err
 				}
 
-				// Initialize git repository
-				cmd = exec.Command("git", "init")
+				// Initialize git repository with detected default branch
+				defaultBranch := getDefaultBranch(t, dir)
+				cmd = exec.Command("git", "init", "-b", defaultBranch)
 				cmd.Dir = dir
 				if err := cmd.Run(); err != nil {
 					return err
@@ -1029,11 +1179,17 @@ func TestRepository_UpdateLFS(t *testing.T) {
 					return err
 				}
 
+				// Create and track a binary file
+				if err := os.WriteFile(filepath.Join(dir, "test.bin"), []byte{0, 1, 2, 3}, 0644); err != nil {
+					return err
+				}
+
 				// Add and commit
 				cmds := [][]string{
 					{"config", "user.name", "Test User"},
 					{"config", "user.email", "test@example.com"},
 					{"add", ".gitattributes"},
+					{"add", "test.bin"},
 					{"commit", "-m", "Initial commit with LFS"},
 				}
 				for _, args := range cmds {
@@ -1047,7 +1203,7 @@ func TestRepository_UpdateLFS(t *testing.T) {
 				// Add origin remote and push
 				cmds = [][]string{
 					{"remote", "add", "origin", originDir},
-					{"push", "-u", "origin", "main"},
+					{"push", "-u", "origin", defaultBranch},
 				}
 				for _, args := range cmds {
 					cmd := exec.Command("git", args...)
@@ -1060,44 +1216,38 @@ func TestRepository_UpdateLFS(t *testing.T) {
 				return nil
 			},
 			modifyRepo: func(t *testing.T, dir string) error {
-				// Create an unstaged file
-				return os.WriteFile(filepath.Join(dir, "unstaged.bin"), []byte{8, 9, 10, 11}, 0644)
+				// Create an untracked file
+				if err := os.WriteFile(filepath.Join(dir, "untracked.bin"), []byte{12, 13, 14, 15}, 0644); err != nil {
+					return err
+				}
+				return nil
 			},
-			expectError:    true,
+			expectError:    false,
 			expectDiffStat: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Create temporary directory for test
-			dir, err := os.MkdirTemp("", "gogitup-test-lfs-*")
+			// Create test repository
+			dir, err := os.MkdirTemp("", "gogitup-test")
 			require.NoError(t, err)
 			defer func() {
 				if err := os.RemoveAll(dir); err != nil {
-					t.Errorf("Failed to remove temp directory: %v", err)
-				}
-				if err := os.RemoveAll(dir + "-origin"); err != nil {
-					t.Errorf("Failed to remove origin directory: %v", err)
-				}
-				if err := os.RemoveAll(dir + "-clone"); err != nil {
-					t.Errorf("Failed to remove clone directory: %v", err)
+					t.Errorf("Failed to remove test directory: %v", err)
 				}
 			}()
 
-			// Set up test repository
-			if tt.setupRepo != nil {
-				err = tt.setupRepo(t, dir)
-				require.NoError(t, err)
-			}
+			// Set up repository
+			err = tt.setupRepo(t, dir)
+			require.NoError(t, err)
 
 			// Create repository instance
 			repo, err := git.PlainOpen(dir)
 			require.NoError(t, err)
 			r := &Repository{
-				Path:        dir,
-				repo:        repo,
-				HasUpstream: tt.hasUpstream,
+				Path: dir,
+				repo: repo,
 			}
 
 			// Modify repository if needed
@@ -1106,22 +1256,18 @@ func TestRepository_UpdateLFS(t *testing.T) {
 				require.NoError(t, err)
 			}
 
-			// Test update
+			// Update repository
 			err = r.Update()
 			if tt.expectError {
 				assert.Error(t, err)
-				if tt.expectError {
-					assert.ErrorIs(t, err, ErrUnstagedChanges)
-				}
+				assert.Equal(t, ErrUncommittedChanges, err)
 			} else {
 				assert.NoError(t, err)
-			}
-
-			// Check diff stats
-			if tt.expectDiffStat {
-				assert.NotEmpty(t, r.DiffStats)
-			} else {
-				assert.Empty(t, r.DiffStats)
+				if tt.expectDiffStat {
+					assert.NotEmpty(t, r.DiffStats)
+				} else {
+					assert.Empty(t, r.DiffStats)
+				}
 			}
 		})
 	}

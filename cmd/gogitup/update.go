@@ -184,8 +184,8 @@ Use the -s or --stat flag to show git diff statistics for updated repositories.`
 					result := updateResult{path: repo.Path}
 					err := repo.Update()
 					if err != nil {
-						if err == git.ErrUnstagedChanges {
-							result.warning = "worktree contains unstaged changes"
+						if err == git.ErrUncommittedChanges {
+							result.warning = "worktree contains uncommitted changes"
 						} else {
 							result.error = err
 						}
