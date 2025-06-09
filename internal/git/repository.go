@@ -381,12 +381,12 @@ func (r *Repository) updateLFSRepository() error {
 	}
 
 	// Get diff stats
-	cmd = exec.Command("git", "diff", "--stat", oldHeadStr+"..HEAD")
+	cmd = exec.Command("git", "diff", "--stat", "--color=always", oldHeadStr+"..HEAD")
 	cmd.Dir = r.Path
 	stats, err := cmd.CombinedOutput()
 	if err != nil {
 		// If the diff command fails, try using git show instead
-		cmd = exec.Command("git", "show", "--stat", "HEAD")
+		cmd = exec.Command("git", "show", "--stat", "--color=always", "HEAD")
 		cmd.Dir = r.Path
 		stats, err = cmd.CombinedOutput()
 		if err != nil {
@@ -621,6 +621,15 @@ func (r *Repository) updateWithUpstream() error {
 
 	auth := r.getAuth()
 
+	// Store the current HEAD for diff stats
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = r.Path
+	oldHead, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to get current HEAD: %s: %w", string(oldHead), err)
+	}
+	oldHeadStr := strings.TrimSpace(string(oldHead))
+
 	// Fetch from upstream
 	err = r.repo.Fetch(&git.FetchOptions{
 		RemoteName: "upstream",
@@ -659,6 +668,21 @@ func (r *Repository) updateWithUpstream() error {
 		}
 		return fmt.Errorf("failed to push to origin: %w", err)
 	}
+
+	// Get diff stats
+	cmd = exec.Command("git", "diff", "--stat", "--color=always", oldHeadStr+"..HEAD")
+	cmd.Dir = r.Path
+	stats, err := cmd.CombinedOutput()
+	if err != nil {
+		// If the diff command fails, try using git show instead
+		cmd = exec.Command("git", "show", "--stat", "--color=always", "HEAD")
+		cmd.Dir = r.Path
+		stats, err = cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("failed to get diff stats: %s: %w", string(stats), err)
+		}
+	}
+	r.DiffStats = string(stats)
 
 	return nil
 }
