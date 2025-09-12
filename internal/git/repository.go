@@ -12,6 +12,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -640,19 +641,22 @@ func (r *Repository) updateWithUpstream() error {
 		return fmt.Errorf("failed to fetch from upstream: %w", err)
 	}
 
-	// Get upstream master reference
-	upstreamMaster, err := r.repo.Reference("refs/remotes/upstream/master", true)
+	// Get the current branch name from the fork
+	currentBranchName := head.Name().Short()
+
+	// Try to get the upstream branch with the same name as the current branch
+	upstreamBranchRef, err := r.repo.Reference(plumbing.ReferenceName("refs/remotes/upstream/"+currentBranchName), true)
 	if err != nil {
-		return fmt.Errorf("failed to get upstream master reference: %w", err)
+		return fmt.Errorf("failed to get upstream/%s reference: %w", currentBranchName, err)
 	}
 
-	// Rebase onto upstream/master
+	// Reset to upstream branch with the same name
 	err = w.Reset(&git.ResetOptions{
 		Mode:   git.HardReset,
-		Commit: upstreamMaster.Hash(),
+		Commit: upstreamBranchRef.Hash(),
 	})
 	if err != nil {
-		return fmt.Errorf("failed to reset to upstream/master: %w", err)
+		return fmt.Errorf("failed to reset to upstream/%s: %w", currentBranchName, err)
 	}
 
 	// Push to origin with force
