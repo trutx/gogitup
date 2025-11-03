@@ -2,6 +2,19 @@
 
 GoGitUp is a command-line tool that helps you manage and update multiple Git repositories efficiently. It scans configured directories for Git repositories and can update them all with a single command, handling both origin and upstream remotes.
 
+## ⚠️ Code Quality Warning
+
+**This codebase was generated using AI-assisted development (Cursor and Claude Code) and has been functionally reviewed only.** This means that if it works, it's considered good enough. However, you should expect:
+
+- Inconsistencies in coding style and patterns
+- Superfluous or redundant code
+- Suboptimal implementations
+- Other code quality issues typical of AI-generated code
+
+The focus was on functionality rather than code elegance. Use at your own discretion.
+
+*(This warning was also AI-generated lol)*
+
 ## Features
 
 - 🔍 Scan directories recursively for Git repositories
