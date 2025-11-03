@@ -379,7 +379,16 @@ func TestRepository_GetAuth(t *testing.T) {
 			setup: func() *Repository {
 				err := os.Setenv("GITHUB_TOKEN", "test-token")
 				require.NoError(t, err)
-				return &Repository{Path: "/path/to/github.com/user/repo"}
+				tmpDir, err := os.MkdirTemp("", "gogitup-test-*")
+				require.NoError(t, err)
+				gitRepo, err := git.PlainInit(tmpDir, false)
+				require.NoError(t, err)
+				_, err = gitRepo.CreateRemote(&config.RemoteConfig{
+					Name: "origin",
+					URLs: []string{"https://github.com/user/repo.git"},
+				})
+				require.NoError(t, err)
+				return &Repository{Path: tmpDir, repo: gitRepo}
 			},
 			wantAuth: true,
 		},
@@ -388,14 +397,32 @@ func TestRepository_GetAuth(t *testing.T) {
 			setup: func() *Repository {
 				err := os.Unsetenv("GITHUB_TOKEN")
 				require.NoError(t, err)
-				return &Repository{Path: "/path/to/github.com/user/repo"}
+				tmpDir, err := os.MkdirTemp("", "gogitup-test-*")
+				require.NoError(t, err)
+				gitRepo, err := git.PlainInit(tmpDir, false)
+				require.NoError(t, err)
+				_, err = gitRepo.CreateRemote(&config.RemoteConfig{
+					Name: "origin",
+					URLs: []string{"https://github.com/user/repo.git"},
+				})
+				require.NoError(t, err)
+				return &Repository{Path: tmpDir, repo: gitRepo}
 			},
 			wantAuth: false,
 		},
 		{
 			name: "non-github repository",
 			setup: func() *Repository {
-				return &Repository{Path: "/path/to/gitlab.com/user/repo"}
+				tmpDir, err := os.MkdirTemp("", "gogitup-test-*")
+				require.NoError(t, err)
+				gitRepo, err := git.PlainInit(tmpDir, false)
+				require.NoError(t, err)
+				_, err = gitRepo.CreateRemote(&config.RemoteConfig{
+					Name: "origin",
+					URLs: []string{"https://gitlab.com/user/repo.git"},
+				})
+				require.NoError(t, err)
+				return &Repository{Path: tmpDir, repo: gitRepo}
 			},
 			wantAuth: false,
 		},
@@ -404,6 +431,9 @@ func TestRepository_GetAuth(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			repo := tt.setup()
+			defer func() {
+				_ = os.RemoveAll(repo.Path)
+			}()
 			auth := repo.getAuth()
 			if tt.wantAuth {
 				assert.NotNil(t, auth)

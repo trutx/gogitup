@@ -12,7 +12,6 @@ import (
 	"github.com/fatih/color"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
@@ -206,9 +205,30 @@ func FindRepositories(directories []string, onFound func(count int)) ([]Reposito
 	return repositories, nil
 }
 
+// isGitHubRepository checks if any remote URL points to GitHub
+func (r *Repository) isGitHubRepository() bool {
+	if r.repo == nil {
+		return false
+	}
+
+	remotes, err := r.repo.Remotes()
+	if err != nil {
+		return false
+	}
+
+	for _, remote := range remotes {
+		for _, url := range remote.Config().URLs {
+			if strings.Contains(url, "github.com") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (r *Repository) getAuth() transport.AuthMethod {
 	// Check if this is a GitHub repository
-	if strings.Contains(r.Path, "github.com") {
+	if r.isGitHubRepository() {
 		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
 			return &http.BasicAuth{
 				Username: "git", // This can be anything except empty
@@ -283,18 +303,34 @@ func (r *Repository) isLFSRepository() bool {
 
 // runGitCommand executes a git command in the repository directory
 func (r *Repository) runGitCommand(args ...string) error {
+	return r.runGitCommandWithAuth(args...)
+}
+
+func (r *Repository) runGitCommandWithAuth(args ...string) error {
+	// If this is a GitHub repository and GITHUB_TOKEN is set, configure credential helper
+	if r.isGitHubRepository() {
+		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
+			// Use git credential helper with the token
+			// We pass the token via git's credential.helper configuration
+			credHelper := fmt.Sprintf("!f() { echo \"username=git\"; echo \"password=%s\"; }; f", token)
+			allArgs := append([]string{"-c", "credential.helper=" + credHelper}, args...)
+
+			cmd := exec.Command("git", allArgs...)
+			cmd.Dir = r.Path
+			cmd.Env = os.Environ()
+
+			output, err := cmd.CombinedOutput()
+			if err != nil {
+				return fmt.Errorf("git command failed: %s: %w", string(output), err)
+			}
+			return nil
+		}
+	}
+
+	// No authentication needed or not a GitHub repository
 	cmd := exec.Command("git", args...)
 	cmd.Dir = r.Path
 	cmd.Env = os.Environ()
-
-	// If this is a GitHub repository and GITHUB_TOKEN is set, use it
-	if strings.Contains(r.Path, "github.com") {
-		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("GIT_ASKPASS=%s", os.DevNull))
-			cmd.Env = append(cmd.Env, "GIT_USERNAME=git")
-			cmd.Env = append(cmd.Env, fmt.Sprintf("GIT_PASSWORD=%s", token))
-		}
-	}
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -365,9 +401,24 @@ func (r *Repository) updateLFSRepository() error {
 			return fmt.Errorf("failed to fetch from upstream: %w", err)
 		}
 
-		// Merge upstream changes
-		if err := r.runGitCommand("merge", "--ff-only", "upstream/"+head.Name().Short()); err != nil {
-			return fmt.Errorf("failed to merge upstream changes: %w", err)
+		// Merge upstream changes with fast-forward only
+		currentBranch := head.Name().Short()
+		cmd = exec.Command("git", "merge", "--ff-only", "upstream/"+currentBranch)
+		cmd.Dir = r.Path
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			outputStr := string(output)
+			// Check if it's a non-fast-forward error
+			if strings.Contains(outputStr, "Not possible to fast-forward") ||
+			   strings.Contains(outputStr, "not possible to fast-forward") {
+				return fmt.Errorf("cannot fast-forward to upstream/%s: local branch has diverged from upstream. Please resolve manually (consider rebasing or merging manually)", currentBranch)
+			}
+			return fmt.Errorf("failed to merge upstream/%s: %s: %w", currentBranch, outputStr, err)
+		}
+
+		// Push to origin to keep fork in sync
+		if err := r.runGitCommand("push", "origin", head.Name().Short()); err != nil {
+			return fmt.Errorf("failed to push to origin: %w", err)
 		}
 	} else {
 		// Fetch from origin
@@ -381,13 +432,15 @@ func (r *Repository) updateLFSRepository() error {
 		}
 	}
 
-	// Get diff stats
-	cmd = exec.Command("git", "diff", "--stat", "--color=always", oldHeadStr+"..HEAD")
+	// Get diff stats with proper width for the graph
+	termWidth := getTerminalWidth()
+	statWidth := fmt.Sprintf("--stat=%d", termWidth)
+	cmd = exec.Command("git", "diff", statWidth, "--color=always", oldHeadStr+"..HEAD")
 	cmd.Dir = r.Path
 	stats, err := cmd.CombinedOutput()
 	if err != nil {
 		// If the diff command fails, try using git show instead
-		cmd = exec.Command("git", "show", "--stat", "--color=always", "HEAD")
+		cmd = exec.Command("git", "show", statWidth, "--color=always", "HEAD")
 		cmd.Dir = r.Path
 		stats, err = cmd.CombinedOutput()
 		if err != nil {
@@ -615,11 +668,6 @@ func (r *Repository) updateWithUpstream() error {
 		return fmt.Errorf("failed to get HEAD: %w", err)
 	}
 
-	w, err := r.repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("failed to get worktree: %w", err)
-	}
-
 	auth := r.getAuth()
 
 	// Store the current HEAD for diff stats
@@ -644,42 +692,34 @@ func (r *Repository) updateWithUpstream() error {
 	// Get the current branch name from the fork
 	currentBranchName := head.Name().Short()
 
-	// Try to get the upstream branch with the same name as the current branch
-	upstreamBranchRef, err := r.repo.Reference(plumbing.ReferenceName("refs/remotes/upstream/"+currentBranchName), true)
+	// Merge upstream changes with fast-forward only
+	cmd = exec.Command("git", "merge", "--ff-only", "upstream/"+currentBranchName)
+	cmd.Dir = r.Path
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to get upstream/%s reference: %w", currentBranchName, err)
-	}
-
-	// Reset to upstream branch with the same name
-	err = w.Reset(&git.ResetOptions{
-		Mode:   git.HardReset,
-		Commit: upstreamBranchRef.Hash(),
-	})
-	if err != nil {
-		return fmt.Errorf("failed to reset to upstream/%s: %w", currentBranchName, err)
-	}
-
-	// Push to origin with force
-	err = r.repo.Push(&git.PushOptions{
-		RemoteName: "origin",
-		RefSpecs:   []config.RefSpec{config.RefSpec(fmt.Sprintf("%s:refs/heads/%s", head.Name().String(), head.Name().Short()))},
-		Force:      true,
-		Auth:       auth,
-	})
-	if err != nil && err != git.NoErrAlreadyUpToDate {
-		if err == transport.ErrAuthenticationRequired {
-			return fmt.Errorf("authentication required: set GITHUB_TOKEN environment variable for GitHub repositories")
+		outputStr := string(output)
+		// Check if it's a non-fast-forward error
+		if strings.Contains(outputStr, "Not possible to fast-forward") ||
+		   strings.Contains(outputStr, "not possible to fast-forward") {
+			return fmt.Errorf("cannot fast-forward to upstream/%s: local branch has diverged from upstream. Please resolve manually (consider rebasing or merging manually)", currentBranchName)
 		}
+		return fmt.Errorf("failed to merge upstream/%s: %s: %w", currentBranchName, outputStr, err)
+	}
+
+	// Push to origin to keep fork in sync
+	if err := r.runGitCommand("push", "origin", currentBranchName); err != nil {
 		return fmt.Errorf("failed to push to origin: %w", err)
 	}
 
-	// Get diff stats
-	cmd = exec.Command("git", "diff", "--stat", "--color=always", oldHeadStr+"..HEAD")
+	// Get diff stats with proper width for the graph
+	termWidth := getTerminalWidth()
+	statWidth := fmt.Sprintf("--stat=%d", termWidth)
+	cmd = exec.Command("git", "diff", statWidth, "--color=always", oldHeadStr+"..HEAD")
 	cmd.Dir = r.Path
 	stats, err := cmd.CombinedOutput()
 	if err != nil {
 		// If the diff command fails, try using git show instead
-		cmd = exec.Command("git", "show", "--stat", "--color=always", "HEAD")
+		cmd = exec.Command("git", "show", statWidth, "--color=always", "HEAD")
 		cmd.Dir = r.Path
 		stats, err = cmd.CombinedOutput()
 		if err != nil {

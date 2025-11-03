@@ -22,9 +22,10 @@ var (
 )
 
 type updateResult struct {
-	path    string
-	error   error
-	warning string
+	path      string
+	error     error
+	warning   string
+	diffStats string
 }
 
 func init() {
@@ -189,6 +190,8 @@ Use the -s or --stat flag to show git diff statistics for updated repositories.`
 						} else {
 							result.error = err
 						}
+					} else {
+						result.diffStats = repo.DiffStats
 					}
 					results <- result
 				}
@@ -233,8 +236,8 @@ Use the -s or --stat flag to show git diff statistics for updated repositories.`
 				if verbose {
 					fmt.Printf("\nUpdated %s\n", result.path)
 				}
-				if showStats && repos[count-1].DiffStats != "" {
-					fmt.Printf("\nChanges in %s:\n%s\n", result.path, repos[count-1].DiffStats)
+				if showStats && result.diffStats != "" {
+					fmt.Printf("\nChanges in %s:\n%s\n", result.path, result.diffStats)
 				}
 			}
 		}
