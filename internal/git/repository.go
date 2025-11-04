@@ -168,18 +168,20 @@ func FindRepositories(directories []string, onFound func(count int)) ([]Reposito
 				}
 
 				// Check for upstream remote
-				remotes, err := repo.Remotes()
-				if err != nil {
-					return nil // Skip if can't read remotes
-				}
-
+				// Note: This may fail for repos with negative refspecs (^refs/...),
+				// which are valid in native Git but not supported by go-git.
+				// We still want to include the repository even if this fails.
 				hasUpstream := false
-				for _, remote := range remotes {
-					if remote.Config().Name == "upstream" {
-						hasUpstream = true
-						break
+				remotes, err := repo.Remotes()
+				if err == nil {
+					for _, remote := range remotes {
+						if remote.Config().Name == "upstream" {
+							hasUpstream = true
+							break
+						}
 					}
 				}
+				// If err != nil, we just treat it as not having upstream
 
 				repositories = append(repositories, Repository{
 					Path:        path,
