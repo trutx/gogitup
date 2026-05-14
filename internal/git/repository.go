@@ -499,6 +499,13 @@ func (r *Repository) Update() error {
 
 	// If update was successful, get diff stats
 	if updateErr == nil {
+		// Reopen repository to refresh go-git's packfile cache after fetch/pull
+		repo, err := git.PlainOpen(r.Path)
+		if err != nil {
+			return fmt.Errorf("failed to reopen repository: %w", err)
+		}
+		r.repo = repo
+
 		newHead, err := r.repo.Head()
 		if err != nil {
 			return fmt.Errorf("failed to get new HEAD: %w", err)
