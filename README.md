@@ -71,6 +71,9 @@ directories:
   - ~/code/projects
   - ~/repos
   - /path/to/repositories
+
+# Optional: disable automatic scanning before updates (default: true)
+# auto_scan: false
 ```
 
 For GitHub private repositories, set your GitHub token:
@@ -94,8 +97,11 @@ gogitup scan -v
 ### Update Repositories
 
 ```bash
-# Update all repositories
+# Update all repositories (automatically scans for new repos first)
 gogitup update
+
+# Skip automatic scan before updating
+gogitup update --no-scan
 
 # Show status information during update
 gogitup update --stat

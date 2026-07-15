@@ -11,6 +11,7 @@ import (
 // Config represents the application configuration
 type Config struct {
 	Directories []string `mapstructure:"directories"`
+	AutoScan    *bool    `mapstructure:"auto_scan"`
 }
 
 // LoadConfig loads the configuration from the config file

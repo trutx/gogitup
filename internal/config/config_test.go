@@ -25,7 +25,7 @@ func TestLoadConfig(t *testing.T) {
 	home, err := os.UserHomeDir()
 	require.NoError(t, err)
 
-	// Create test config file
+	// Create test config files
 	configFile := filepath.Join(tmpDir, "config.yaml")
 	configContent := []byte(`
 directories:
@@ -33,6 +33,15 @@ directories:
   - /path/to/repos2
   - ~/code/projects
 `)
+	autoScanFalseConfig := filepath.Join(tmpDir, "autoscan_false.yaml")
+	falseVal := false
+	err = os.WriteFile(autoScanFalseConfig, []byte("directories:\n  - /path/to/repos1\nauto_scan: false\n"), 0644)
+	require.NoError(t, err)
+
+	autoScanTrueConfig := filepath.Join(tmpDir, "autoscan_true.yaml")
+	trueVal := true
+	err = os.WriteFile(autoScanTrueConfig, []byte("directories:\n  - /path/to/repos1\nauto_scan: true\n"), 0644)
+	require.NoError(t, err)
 	err = os.WriteFile(configFile, configContent, 0644)
 	require.NoError(t, err)
 
@@ -40,6 +49,7 @@ directories:
 		name         string
 		setupConfig  func()
 		wantDirs     []string
+		wantAutoScan *bool
 		wantErr      bool
 		wantErrMatch string
 	}{
@@ -54,7 +64,28 @@ directories:
 				"/path/to/repos2",
 				filepath.Join(home, "code/projects"),
 			},
-			wantErr: false,
+			wantAutoScan: nil,
+			wantErr:      false,
+		},
+		{
+			name: "auto_scan false",
+			setupConfig: func() {
+				viper.Reset()
+				viper.SetConfigFile(autoScanFalseConfig)
+			},
+			wantDirs:     []string{"/path/to/repos1"},
+			wantAutoScan: &falseVal,
+			wantErr:      false,
+		},
+		{
+			name: "auto_scan true",
+			setupConfig: func() {
+				viper.Reset()
+				viper.SetConfigFile(autoScanTrueConfig)
+			},
+			wantDirs:     []string{"/path/to/repos1"},
+			wantAutoScan: &trueVal,
+			wantErr:      false,
 		},
 		{
 			name: "missing config file",
@@ -104,6 +135,12 @@ directories:
 			} else {
 				assert.NoError(t, err)
 				assert.Equal(t, tt.wantDirs, cfg.Directories)
+				if tt.wantAutoScan == nil {
+					assert.Nil(t, cfg.AutoScan)
+				} else {
+					require.NotNil(t, cfg.AutoScan)
+					assert.Equal(t, *tt.wantAutoScan, *cfg.AutoScan)
+				}
 			}
 		})
 	}

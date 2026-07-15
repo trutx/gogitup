@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +17,7 @@ import (
 var (
 	showStats bool
 	threads   int
+	noScan    bool
 )
 
 type updateResult struct {
@@ -32,19 +31,7 @@ func init() {
 	rootCmd.AddCommand(updateCmd)
 	updateCmd.Flags().IntVarP(&threads, "threads", "t", runtime.NumCPU(), "number of concurrent repository updates")
 	updateCmd.Flags().BoolVarP(&showStats, "stat", "s", false, "show git diff stats for updated repositories")
-}
-
-// promptForScan asks the user if they want to run scan first
-func promptForScan() bool {
-	reader := bufio.NewReader(os.Stdin)
-	fmt.Print("Repository list is older than 14 days. Run scan first? [Y/n] ")
-	response, err := reader.ReadString('\n')
-	if err != nil {
-		return true // Default to yes on error
-	}
-	response = strings.ToLower(strings.TrimSpace(response))
-	// Only return false for explicit "no" responses
-	return response != "n" && response != "no"
+	updateCmd.Flags().BoolVar(&noScan, "no-scan", false, "disable automatic repository scan before update")
 }
 
 // runScan executes the scan command
@@ -77,9 +64,12 @@ func runScan() error {
 var updateCmd = &cobra.Command{
 	Use:   "update",
 	Short: "Update all found Git repositories",
-	Long: `Update all Git repositories that were found during the last scan.
-This command will fetch and pull changes from origin, and for forks it will
-rebase onto upstream/master.
+	Long: `Update all Git repositories by scanning for them and pulling changes.
+By default, a scan for new repositories runs automatically before updating.
+Disable auto-scan with --no-scan or set auto_scan: false in the config file.
+
+For each repository, it will fetch and pull changes from origin, and for
+forks it will rebase onto upstream/master.
 
 Use the -s or --stat flag to show git diff statistics for updated repositories.`,
 	SilenceErrors: true,
@@ -129,14 +119,25 @@ Use the -s or --stat flag to show git diff statistics for updated repositories.`
 		}
 
 		info, err := os.Stat(reposFile)
-		if err == nil { // Only check age if file exists
+		if err == nil {
 			age := time.Since(info.ModTime())
 			if age > 14*24*time.Hour {
-				if promptForScan() {
-					if err := runScan(); err != nil {
-						return fmt.Errorf("failed to run scan: %w", err)
-					}
-				}
+				fmt.Fprintf(os.Stderr, "Warning: Repository list is older than 14 days.\n")
+			}
+		}
+
+		// Determine if auto-scan should run
+		shouldScan := !noScan
+		if shouldScan {
+			cfg, err := config.LoadConfig()
+			if err == nil && cfg.AutoScan != nil && !*cfg.AutoScan {
+				shouldScan = false
+			}
+		}
+
+		if shouldScan {
+			if err := runScan(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: auto-scan failed: %v\n", err)
 			}
 		}
 
