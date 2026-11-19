@@ -3,14 +3,13 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -18,6 +17,48 @@ import (
 	"github.com/stretchr/testify/require"
 	gitutil "github.com/trutx/gogitup/internal/git"
 )
+
+// testGitEnv isolates tests from the developer's git configuration and from
+// credential prompting.
+func testGitEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+}
+
+// runGitIn runs git inside dir and fails the test if it does not succeed.
+func runGitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git %s: %s", strings.Join(args, " "), string(out))
+}
+
+// initCommittedRepo turns dir into a repository holding a single commit.
+func initCommittedRepo(t *testing.T, dir string) {
+	t.Helper()
+	runGitIn(t, dir, "init", "--initial-branch=main")
+	runGitIn(t, dir, "config", "user.name", "Test User")
+	runGitIn(t, dir, "config", "user.email", "test@example.com")
+	runGitIn(t, dir, "config", "commit.gpgsign", "false")
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "test.txt"), []byte("test content"), 0644))
+	runGitIn(t, dir, "add", "test.txt")
+	runGitIn(t, dir, "commit", "-m", "Initial commit")
+}
+
+// addBareRemote creates a bare repository holding dir's history and adds it as
+// dir's origin remote.
+func addBareRemote(t *testing.T, dir string) string {
+	t.Helper()
+	remoteDir := dir + "_remote.git"
+	require.NoError(t, os.MkdirAll(remoteDir, 0755))
+	runGitIn(t, remoteDir, "init", "--bare", "--initial-branch=main")
+	runGitIn(t, dir, "remote", "add", "origin", remoteDir)
+	runGitIn(t, dir, "push", "-u", "origin", "main")
+	return remoteDir
+}
 
 func TestUpdateCommand_ReposFileAge(t *testing.T) {
 	tests := []struct {
@@ -197,42 +238,9 @@ func TestUpdateCommand_Flags(t *testing.T) {
 				err := os.MkdirAll(repoDir, 0755)
 				require.NoError(t, err)
 
-				repo, err := git.PlainInit(repoDir, false)
-				require.NoError(t, err)
-
-				// Create a test file and commit it
-				testFile := filepath.Join(repoDir, "test.txt")
-				err = os.WriteFile(testFile, []byte("test content"), 0644)
-				require.NoError(t, err)
-
-				w, err := repo.Worktree()
-				require.NoError(t, err)
-
-				_, err = w.Add("test.txt")
-				require.NoError(t, err)
-
-				_, err = w.Commit("Initial commit", &git.CommitOptions{
-					Author: &object.Signature{
-						Name:  "Test User",
-						Email: "test@example.com",
-						When:  time.Now(),
-					},
-				})
-				require.NoError(t, err)
-
-				// Create a bare clone to serve as the remote
-				remoteDir := filepath.Join(tmpDir, "remote.git")
-				_, err = git.PlainClone(remoteDir, true, &git.CloneOptions{
-					URL: repoDir,
-				})
-				require.NoError(t, err)
-
-				// Add the remote to the original repository
-				_, err = repo.CreateRemote(&config.RemoteConfig{
-					Name: "origin",
-					URLs: []string{remoteDir},
-				})
-				require.NoError(t, err)
+				testGitEnv(t)
+				initCommittedRepo(t, repoDir)
+				addBareRemote(t, repoDir)
 
 				// Save repository info
 				repoInfo := gitutil.Repository{
@@ -311,39 +319,9 @@ func TestUpdateCommand_AutoScanConfig(t *testing.T) {
 	err = os.MkdirAll(repoDir, 0755)
 	require.NoError(t, err)
 
-	repo, err := git.PlainInit(repoDir, false)
-	require.NoError(t, err)
-
-	testFile := filepath.Join(repoDir, "test.txt")
-	err = os.WriteFile(testFile, []byte("test content"), 0644)
-	require.NoError(t, err)
-
-	w, err := repo.Worktree()
-	require.NoError(t, err)
-
-	_, err = w.Add("test.txt")
-	require.NoError(t, err)
-
-	_, err = w.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{
-			Name:  "Test User",
-			Email: "test@example.com",
-			When:  time.Now(),
-		},
-	})
-	require.NoError(t, err)
-
-	remoteDir := filepath.Join(tmpDir, "remote.git")
-	_, err = git.PlainClone(remoteDir, true, &git.CloneOptions{
-		URL: repoDir,
-	})
-	require.NoError(t, err)
-
-	_, err = repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{remoteDir},
-	})
-	require.NoError(t, err)
+	testGitEnv(t)
+	initCommittedRepo(t, repoDir)
+	addBareRemote(t, repoDir)
 
 	// Create config with auto_scan: false
 	configFile := filepath.Join(tmpDir, "config.yaml")

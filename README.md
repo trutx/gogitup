@@ -24,13 +24,14 @@ The focus was on functionality rather than code elegance. Use at your own discre
 - 🔱 Support for fork workflow (origin/upstream remotes)
 - 📦 Native Git LFS support for large file repositories
 - 💾 Cache repository information for faster subsequent runs
-- 🚫 Skip repositories with unstaged changes
+- 🚫 Skip repositories with uncommitted changes to tracked files
 
 ## Installation
 
 ### Prerequisites
 
-- Go 1.21 or later
+- Go 1.26.5 or later (matching `go.mod`)
+- Git (gogitup runs `git` for every operation, so your existing git setup applies)
 - Git LFS (optional, required only for LFS repositories)
 
 ### From Source
@@ -82,6 +83,21 @@ For GitHub private repositories, set your GitHub token:
 export GITHUB_TOKEN=your_token_here
 ```
 
+The token is offered to git as a fallback credential helper for `github.com` only,
+and only behind whatever helper you already configured.
+
+### Git configuration
+
+GoGitUp delegates fetching, merging and pushing to `git`, so everything in your
+git configuration is honoured automatically:
+
+- `url.*.insteadOf` rewriting (e.g. SSH to HTTPS)
+- `credential.helper` and other credential sources
+- `include` / `includeIf` files, `http.*` settings and proxies
+- `core.sshCommand` and `GIT_*` environment variables
+
+If `git fetch` works in a repository, `gogitup update` works there too.
+
 ## Usage
 
 ### Scan for Repositories
@@ -108,15 +124,14 @@ gogitup update --stat
 
 # Show verbose output
 gogitup update -v
+
+# Limit how many repositories are updated concurrently (default: number of CPUs)
+gogitup update --threads 4
 ```
 
 #### Git LFS Support
 
-GoGitUp automatically detects repositories that use Git Large File Storage (LFS) and handles them appropriately:
-- Automatically identifies LFS repositories through `.gitattributes`
-- Uses native Git commands for LFS operations
-- Maintains proper LFS pointer files and object storage
-- Shows correct diff statistics for LFS files
+GoGitUp detects repositories that use Git Large File Storage (LFS) from their `.gitattributes` and checks that `git-lfs` is installed before updating them. The update itself is the same `git fetch` every other repository gets, so LFS smudge/filter handling is exactly what git does.
 
 Note: Git LFS must be installed on your system to handle LFS repositories.
 
@@ -132,10 +147,21 @@ You can specify a custom cache location with the `--repos-file` flag.
 ## Error Handling
 
 GoGitUp handles various error scenarios:
-- Repositories with unstaged changes are skipped
-- Authentication errors for private repositories
-- Invalid or corrupted Git repositories
-- Inaccessible directories or files
+- Repositories with uncommitted changes to tracked files are skipped
+- Fetch, merge and push follow git's own behaviour, so authentication, proxy and
+  `insteadOf` problems surface with git's own message
+- Directories that cannot be read are skipped during scan; per-repository
+  failures during update are reported with the path and git's message
+
+Two broken-repository cases come with repair instructions instead of a bare git
+error:
+- `bad object refs/...` / `did not send all necessary objects`: cached
+  remote-tracking refs point at commits the clone never fetched
+- `unresolved deltas left after unpacking`: the object store itself is
+  incomplete (common in shallow clones touched by old gogitup releases)
+
+Both hints name the exact `git` commands to run; GoGitUp never repairs a
+repository on its own.
 
 ## Contributing
 

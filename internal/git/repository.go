@@ -1,20 +1,18 @@
 package git
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/fatih/color"
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing/format/diff"
-	"github.com/go-git/go-git/v5/plumbing/transport"
-	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/viper"
 	"golang.org/x/term"
@@ -23,15 +21,15 @@ import (
 // Common errors
 var (
 	ErrUncommittedChanges = fmt.Errorf("worktree contains uncommitted changes to tracked files")
+	ErrGitNotInstalled    = errors.New("git is not installed or not available in PATH")
 )
 
 // Repository represents a Git repository
 type Repository struct {
-	Path        string          `json:"path"`
-	HasUpstream bool            `json:"has_upstream"`
-	LastScanned time.Time       `json:"last_scanned"`
-	DiffStats   string          `json:"-"`
-	repo        *git.Repository `json:"-"`
+	Path        string    `json:"path"`
+	HasUpstream bool      `json:"has_upstream"`
+	LastScanned time.Time `json:"last_scanned"`
+	DiffStats   string    `json:"-"`
 }
 
 // GetCacheFile returns the default path to the cache file
@@ -107,16 +105,12 @@ func LoadRepositories() ([]Repository, error) {
 		return nil, fmt.Errorf("failed to unmarshal repositories: %w", err)
 	}
 
-	// Filter out repositories that can't be opened
+	// Filter out repositories that are no longer valid
 	validRepos := make([]Repository, 0, len(repositories))
-	for i := range repositories {
-		repo, err := git.PlainOpen(repositories[i].Path)
-		if err != nil {
-			// Skip repositories that can't be opened
-			continue
+	for _, repository := range repositories {
+		if _, err := remoteNames(repository.Path); err == nil {
+			validRepos = append(validRepos, repository)
 		}
-		repositories[i].repo = repo
-		validRepos = append(validRepos, repositories[i])
 	}
 
 	return validRepos, nil
@@ -128,7 +122,8 @@ func FindRepositories(directories []string, onFound func(count int)) ([]Reposito
 	count := 0
 
 	for _, dir := range directories {
-		// Expand home directory if path starts with ~
+
+		// Expand home directory if path starts with ~/
 		if strings.HasPrefix(dir, "~/") {
 			home, err := os.UserHomeDir()
 			if err != nil {
@@ -159,44 +154,27 @@ func FindRepositories(directories []string, onFound func(count int)) ([]Reposito
 				return nil
 			}
 
-			// Check for .git directory
-			gitDir := filepath.Join(path, ".git")
-			if stat, err := os.Stat(gitDir); err == nil && stat.IsDir() {
-				repo, err := git.PlainOpen(path)
-				if err != nil {
-					return nil // Skip invalid repositories
-				}
-
-				// Check for upstream remote
-				// Note: This may fail for repos with negative refspecs (^refs/...),
-				// which are valid in native Git but not supported by go-git.
-				// We still want to include the repository even if this fails.
-				hasUpstream := false
-				remotes, err := repo.Remotes()
-				if err == nil {
-					for _, remote := range remotes {
-						if remote.Config().Name == "upstream" {
-							hasUpstream = true
-							break
-						}
-					}
-				}
-				// If err != nil, we just treat it as not having upstream
-
-				repositories = append(repositories, Repository{
-					Path:        path,
-					HasUpstream: hasUpstream,
-					repo:        repo,
-				})
-				count++
-				if onFound != nil {
-					onFound(count)
-				}
-
-				return filepath.SkipDir
+			if !hasGitDir(path) {
+				return nil
 			}
 
-			return nil
+			// Asking git for the remotes both confirms the repository is usable
+			// and tells us whether it is a fork
+			remotes, err := remoteNames(path)
+			if err != nil {
+				return nil
+			}
+
+			repositories = append(repositories, Repository{
+				Path:        path,
+				HasUpstream: slices.Contains(remotes, "upstream"),
+			})
+			count++
+			if onFound != nil {
+				onFound(count)
+			}
+
+			return filepath.SkipDir
 		})
 
 		if err != nil {
@@ -207,38 +185,26 @@ func FindRepositories(directories []string, onFound func(count int)) ([]Reposito
 	return repositories, nil
 }
 
-// isGitHubRepository checks if any remote URL points to GitHub
-func (r *Repository) isGitHubRepository() bool {
-	if r.repo == nil {
-		return false
-	}
-
-	remotes, err := r.repo.Remotes()
+// hasGitDir reports whether path contains a .git directory or gitfile.
+func hasGitDir(path string) bool {
+	info, err := os.Stat(filepath.Join(path, ".git"))
 	if err != nil {
 		return false
 	}
-
-	for _, remote := range remotes {
-		for _, url := range remote.Config().URLs {
-			if strings.Contains(url, "github.com") {
-				return true
-			}
-		}
-	}
-	return false
+	return info.IsDir() || info.Mode().IsRegular()
 }
 
-func (r *Repository) getAuth() transport.AuthMethod {
-	// Check if this is a GitHub repository
-	if r.isGitHubRepository() {
-		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-			return &http.BasicAuth{
-				Username: "git", // This can be anything except empty
-				Password: token,
-			}
-		}
+// remoteNames returns the configured remotes of a repository. An error means
+// git cannot work with path as a repository.
+func remoteNames(path string) ([]string, error) {
+	out, err := gitOutput(path, "remote")
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	if out == "" {
+		return nil, nil
+	}
+	return strings.Split(out, "\n"), nil
 }
 
 // getTerminalWidth returns the terminal width, defaulting to 80 if not in a terminal
@@ -251,43 +217,6 @@ func getTerminalWidth() int {
 		return 80
 	}
 	return width
-}
-
-// formatDiffStat formats a single diff stat line with proper width constraints
-func formatDiffStat(path string, added, removed int, maxPathLen int, maxNumLen int, termWidth int, green, red func(string) string) string {
-	// Calculate available space for the graph part
-	// Format: " path | NNN graph"
-	// 1 space + path + 1 space + | + 1 space + NNN + 1 space + graph
-	graphWidth := termWidth - maxPathLen - maxNumLen - 5
-
-	// Calculate the graph part
-	total := added + removed
-	graph := ""
-	if graphWidth > 0 {
-		// Scale the number of symbols to fit the graph width
-		symbolCount := total
-		if symbolCount > graphWidth {
-			symbolCount = graphWidth
-		}
-
-		// Calculate proportions of + and - symbols
-		plusCount := 0
-		minusCount := 0
-		if total > 0 {
-			plusCount = (added * symbolCount) / total
-			minusCount = symbolCount - plusCount
-		}
-
-		graph = green(strings.Repeat("+", plusCount)) + red(strings.Repeat("-", minusCount))
-	}
-
-	return fmt.Sprintf(" %-*s | %*d %s",
-		maxPathLen,
-		path,
-		maxNumLen,
-		total,
-		graph,
-	)
 }
 
 // isLFSRepository checks if the repository uses Git LFS by looking for .gitattributes with LFS entries
@@ -303,439 +232,307 @@ func (r *Repository) isLFSRepository() bool {
 	return strings.Contains(string(data), "filter=lfs")
 }
 
-// runGitCommand executes a git command in the repository directory
-func (r *Repository) runGitCommand(args ...string) error {
-	return r.runGitCommandWithAuth(args...)
-}
+// Update updates the repository by fetching and pulling changes
+func (r *Repository) Update() error {
+	if err := ensureGitAvailable(); err != nil {
+		return err
+	}
 
-func (r *Repository) runGitCommandWithAuth(args ...string) error {
-	// If this is a GitHub repository and GITHUB_TOKEN is set, configure credential helper
-	if r.isGitHubRepository() {
-		if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-			// Use git credential helper with the token
-			// We pass the token via git's credential.helper configuration
-			credHelper := fmt.Sprintf("!f() { echo \"username=git\"; echo \"password=%s\"; }; f", token)
-			allArgs := append([]string{"-c", "credential.helper=" + credHelper}, args...)
-
-			cmd := exec.Command("git", allArgs...)
-			cmd.Dir = r.Path
-			cmd.Env = os.Environ()
-
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				return fmt.Errorf("git command failed: %s: %w", string(output), err)
-			}
-			return nil
+	if r.isLFSRepository() {
+		if _, err := exec.LookPath("git-lfs"); err != nil {
+			return fmt.Errorf("git-lfs is not installed: %w", err)
 		}
 	}
 
-	// No authentication needed or not a GitHub repository
-	cmd := exec.Command("git", args...)
-	cmd.Dir = r.Path
-	cmd.Env = os.Environ()
-
-	output, err := cmd.CombinedOutput()
+	// Repositories without tracked files have nothing to update
+	tracked, err := gitOutput(r.Path, "ls-files")
 	if err != nil {
-		return fmt.Errorf("git command failed: %s: %w", string(output), err)
+		return err
 	}
-	return nil
-}
-
-// updateLFSRepository updates an LFS-enabled repository using native git commands
-func (r *Repository) updateLFSRepository() error {
-	// Check if git-lfs is installed
-	if _, err := exec.LookPath("git-lfs"); err != nil {
-		return fmt.Errorf("git-lfs is not installed: %w", err)
-	}
-
-	// Get current branch
-	head, err := r.repo.Head()
-	if err != nil {
-		return fmt.Errorf("failed to get HEAD: %w", err)
-	}
-
-	// Check for uncommitted changes to tracked files only
-	// First, get the list of tracked files
-	cmd := exec.Command("git", "ls-files")
-	cmd.Dir = r.Path
-	trackedFiles, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to get tracked files: %s: %w", string(trackedFiles), err)
-	}
-
-	// If there are no tracked files, we can proceed with the update
-	if len(strings.TrimSpace(string(trackedFiles))) == 0 {
+	if tracked == "" {
 		return nil
 	}
 
-	// Check for staged changes to tracked files
-	cmd = exec.Command("git", "diff-index", "--quiet", "HEAD", "--")
-	cmd.Dir = r.Path
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return ErrUncommittedChanges
-		}
-		return fmt.Errorf("failed to check staged changes: %s: %w", string(out), err)
+	if err := r.checkCleanWorktree(); err != nil {
+		return err
 	}
 
-	// Check for unstaged changes to tracked files
-	cmd = exec.Command("git", "diff-files", "--quiet", "--")
-	cmd.Dir = r.Path
-	if out, err := cmd.CombinedOutput(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-			return ErrUncommittedChanges
-		}
-		return fmt.Errorf("failed to check unstaged changes: %s: %w", string(out), err)
-	}
-
-	// Store the current HEAD for diff stats
-	cmd = exec.Command("git", "rev-parse", "HEAD")
-	cmd.Dir = r.Path
-	oldHead, err := cmd.CombinedOutput()
+	oldHead, err := gitOutput(r.Path, "rev-parse", "HEAD")
 	if err != nil {
-		return fmt.Errorf("failed to get current HEAD: %s: %w", string(oldHead), err)
+		return fmt.Errorf("failed to get current HEAD: %w", err)
 	}
-	oldHeadStr := strings.TrimSpace(string(oldHead))
 
+	if err := r.fetchAndFastForward(); err != nil {
+		return err
+	}
+
+	newHead, err := gitOutput(r.Path, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("failed to get new HEAD: %w", err)
+	}
+
+	// Only report stats when the update actually moved HEAD
+	if newHead == oldHead {
+		return nil
+	}
+
+	stats, err := r.diffStats(oldHead)
+	if err != nil {
+		return err
+	}
+	r.DiffStats = stats
+
+	return nil
+}
+
+// checkCleanWorktree returns ErrUncommittedChanges when tracked files have
+// staged or unstaged modifications. Untracked files are ignored.
+func (r *Repository) checkCleanWorktree() error {
+	staged, err := gitSucceeded(r.Path, "diff-index", "--quiet", "HEAD", "--")
+	if err != nil {
+		return fmt.Errorf("failed to check staged changes: %w", err)
+	}
+	if !staged {
+		return ErrUncommittedChanges
+	}
+
+	unstaged, err := gitSucceeded(r.Path, "diff-files", "--quiet", "--")
+	if err != nil {
+		return fmt.Errorf("failed to check unstaged changes: %w", err)
+	}
+	if !unstaged {
+		return ErrUncommittedChanges
+	}
+
+	return nil
+}
+
+// fetchAndFastForward fetches the repository's remotes and fast-forwards the
+// current branch, pushing to origin afterwards when the repository is a fork.
+func (r *Repository) fetchAndFastForward() error {
 	if r.HasUpstream {
-		// Fetch from upstream
-		if err := r.runGitCommand("fetch", "upstream"); err != nil {
-			return fmt.Errorf("failed to fetch from upstream: %w", err)
+		if err := gitRun(r.Path, "fetch", "upstream"); err != nil {
+			return fmt.Errorf("failed to fetch from upstream: %w", r.withFetchHint(err))
 		}
-
-		// Merge upstream changes with fast-forward only
-		currentBranch := head.Name().Short()
-		cmd = exec.Command("git", "merge", "--ff-only", "upstream/"+currentBranch)
-		cmd.Dir = r.Path
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			outputStr := string(output)
-			// Check if it's a non-fast-forward error
-			if strings.Contains(outputStr, "Not possible to fast-forward") ||
-			   strings.Contains(outputStr, "not possible to fast-forward") {
-				return fmt.Errorf("cannot fast-forward to upstream/%s: local branch has diverged from upstream. Please resolve manually (consider rebasing or merging manually)", currentBranch)
-			}
-			return fmt.Errorf("failed to merge upstream/%s: %s: %w", currentBranch, outputStr, err)
+	} else {
+		if err := gitRun(r.Path, "fetch", "origin"); err != nil {
+			return fmt.Errorf("failed to fetch from origin: %w", r.withFetchHint(err))
 		}
+	}
 
-		// Push to origin to keep fork in sync
-		if err := r.runGitCommand("push", "origin", head.Name().Short()); err != nil {
+	branch, err := currentBranch(r.Path)
+	if err != nil {
+		return err
+	}
+
+	remote := "origin"
+	if r.HasUpstream {
+		remote = "upstream"
+	}
+
+	if err := r.fastForward(remote, branch); err != nil {
+		return err
+	}
+
+	// Keep the fork's origin in sync with upstream
+	if r.HasUpstream {
+		if err := gitRun(r.Path, "push", "origin", branch); err != nil {
 			return fmt.Errorf("failed to push to origin: %w", err)
 		}
-	} else {
-		// Fetch from origin
-		if err := r.runGitCommand("fetch", "origin"); err != nil {
-			return fmt.Errorf("failed to fetch from origin: %w", err)
-		}
-
-		// Fast-forward to origin
-		if err := r.runGitCommand("merge", "--ff-only", "origin/"+head.Name().Short()); err != nil {
-			return fmt.Errorf("failed to merge origin changes: %w", err)
-		}
-	}
-
-	// Get diff stats with proper width for the graph
-	termWidth := getTerminalWidth()
-	statWidth := fmt.Sprintf("--stat=%d", termWidth)
-	cmd = exec.Command("git", "diff", statWidth, "--color=always", oldHeadStr+"..HEAD")
-	cmd.Dir = r.Path
-	stats, err := cmd.CombinedOutput()
-	if err != nil {
-		// If the diff command fails, try using git show instead
-		cmd = exec.Command("git", "show", statWidth, "--color=always", "HEAD")
-		cmd.Dir = r.Path
-		stats, err = cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to get diff stats: %s: %w", string(stats), err)
-		}
-	}
-	r.DiffStats = string(stats)
-
-	return nil
-}
-
-// Update updates the repository by fetching and pulling changes
-func (r *Repository) Update() error {
-	// Check if this is an LFS repository
-	if r.isLFSRepository() {
-		return r.updateLFSRepository()
-	}
-
-	// Get worktree and check for unstaged changes first
-	w, err := r.repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("failed to get worktree: %w", err)
-	}
-
-	// Check for uncommitted changes to tracked files
-	status, err := w.Status()
-	if err != nil {
-		return fmt.Errorf("failed to get worktree status: %w", err)
-	}
-
-	// Check only tracked files for changes
-	for _, fileStatus := range status {
-		if fileStatus.Staging != git.Untracked && fileStatus.Worktree != git.Untracked {
-			if fileStatus.Staging != git.Unmodified || fileStatus.Worktree != git.Unmodified {
-				return ErrUncommittedChanges
-			}
-		}
-	}
-
-	// Get current HEAD for diff comparison
-	head, err := r.repo.Head()
-	if err != nil {
-		return fmt.Errorf("failed to get HEAD: %w", err)
-	}
-	oldHead := head.Hash()
-
-	// Perform update
-	var updateErr error
-	if r.HasUpstream {
-		updateErr = r.updateWithUpstream()
-	} else {
-		updateErr = r.updateOrigin()
-	}
-
-	// If update was successful, get diff stats
-	if updateErr == nil {
-		// Reopen repository to refresh go-git's packfile cache after fetch/pull
-		repo, err := git.PlainOpen(r.Path)
-		if err != nil {
-			return fmt.Errorf("failed to reopen repository: %w", err)
-		}
-		r.repo = repo
-
-		newHead, err := r.repo.Head()
-		if err != nil {
-			return fmt.Errorf("failed to get new HEAD: %w", err)
-		}
-
-		// Only get diff stats if HEAD changed
-		if oldHead != newHead.Hash() {
-			// Get the commits
-			oldCommit, err := r.repo.CommitObject(oldHead)
-			if err != nil {
-				return fmt.Errorf("failed to get old commit: %w", err)
-			}
-			newCommit, err := r.repo.CommitObject(newHead.Hash())
-			if err != nil {
-				return fmt.Errorf("failed to get new commit: %w", err)
-			}
-
-			// Get the patch
-			patch, err := oldCommit.Patch(newCommit)
-			if err != nil {
-				return fmt.Errorf("failed to get patch: %w", err)
-			}
-
-			// Calculate stats
-			stats := make(map[string]struct {
-				added   int
-				removed int
-			})
-
-			for _, filePatch := range patch.FilePatches() {
-				from, to := filePatch.Files()
-				var path string
-				if to != nil {
-					path = to.Path()
-				} else if from != nil {
-					path = from.Path()
-				}
-				if path == "" {
-					continue
-				}
-
-				for _, chunk := range filePatch.Chunks() {
-					lines := strings.Count(chunk.Content(), "\n")
-					switch chunk.Type() {
-					case diff.Add:
-						stats[path] = struct {
-							added   int
-							removed int
-						}{
-							added:   stats[path].added + lines,
-							removed: stats[path].removed,
-						}
-					case diff.Delete:
-						stats[path] = struct {
-							added   int
-							removed int
-						}{
-							added:   stats[path].added,
-							removed: stats[path].removed + lines,
-						}
-					}
-				}
-			}
-
-			// Format stats similar to git diff --stat
-			var statLines []string
-			var totalAdded, totalRemoved int
-
-			// Get terminal width
-			termWidth := getTerminalWidth()
-
-			// Find the longest path and the maximum number width
-			maxPathLen := 0
-			maxTotal := 0
-			for path, stat := range stats {
-				if len(path) > maxPathLen {
-					maxPathLen = len(path)
-				}
-				if total := stat.added + stat.removed; total > maxTotal {
-					maxTotal = total
-				}
-			}
-
-			// Calculate the width needed for the number
-			maxNumLen := len(fmt.Sprintf("%d", maxTotal))
-
-			green := color.New(color.FgGreen).SprintfFunc()
-			red := color.New(color.FgRed).SprintfFunc()
-
-			// Format each line
-			for path, stat := range stats {
-				totalAdded += stat.added
-				totalRemoved += stat.removed
-				statLines = append(statLines, formatDiffStat(
-					path,
-					stat.added,
-					stat.removed,
-					maxPathLen,
-					maxNumLen,
-					termWidth,
-					func(s string) string { return green("%s", s) },
-					func(s string) string { return red("%s", s) },
-				))
-			}
-
-			if len(statLines) > 0 {
-				r.DiffStats = strings.Join(append(statLines, fmt.Sprintf(" %d files changed, %d insertions(+), %d deletions(-)",
-					len(stats),
-					totalAdded,
-					totalRemoved,
-				)), "\n")
-			}
-		}
-	}
-
-	return updateErr
-}
-
-func (r *Repository) updateOrigin() error {
-	// Get current branch
-	head, err := r.repo.Head()
-	if err != nil {
-		return fmt.Errorf("failed to get HEAD: %w", err)
-	}
-
-	w, err := r.repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("failed to get worktree: %w", err)
-	}
-
-	auth := r.getAuth()
-
-	// Fetch from origin
-	err = r.repo.Fetch(&git.FetchOptions{
-		RemoteName: "origin",
-		RefSpecs:   []config.RefSpec{config.RefSpec("+refs/heads/*:refs/remotes/origin/*")},
-		Auth:       auth,
-	})
-	if err != nil && err != git.NoErrAlreadyUpToDate {
-		return fmt.Errorf("failed to fetch from origin: %w", err)
-	}
-
-	// Pull changes
-	err = w.Pull(&git.PullOptions{
-		RemoteName:    "origin",
-		ReferenceName: head.Name(),
-		Auth:          auth,
-	})
-	if err != nil {
-		if err == git.NoErrAlreadyUpToDate {
-			return nil
-		}
-		if err == git.ErrUnstagedChanges {
-			return ErrUncommittedChanges
-		}
-		if err == transport.ErrAuthenticationRequired {
-			return fmt.Errorf("authentication required: set GITHUB_TOKEN environment variable for GitHub repositories")
-		}
-		return fmt.Errorf("failed to pull from origin: %w", err)
 	}
 
 	return nil
 }
 
-func (r *Repository) updateWithUpstream() error {
-	// Get current branch
-	head, err := r.repo.Head()
-	if err != nil {
-		return fmt.Errorf("failed to get HEAD: %w", err)
+// withFetchHint adds repair instructions when a fetch failed because the local
+// object store is incomplete or its cached refs point at commits it does not
+// have. go-git used to record a ref for every advertised branch, which left such
+// dangling refs behind, most often in shallow clones.
+func (r *Repository) withFetchHint(err error) error {
+	msg := err.Error()
+	quoted := fmt.Sprintf("%q", r.Path)
+
+	// Deltas against objects that were never stored: the object database itself
+	// is incomplete, so ref pruning alone cannot help
+	if strings.Contains(msg, "unresolved deltas left after unpacking") ||
+		strings.Contains(msg, "unpack-objects failed") {
+		hint := "hint: the object store is incomplete, so this clone cannot fetch; repair with:\n" +
+			fmt.Sprintf("  git -C %s fetch --refetch %sorigin", quoted, r.unshallowFlag())
+		return fmt.Errorf("%w\n%s", err, hint)
 	}
 
-	auth := r.getAuth()
-
-	// Store the current HEAD for diff stats
-	cmd := exec.Command("git", "rev-parse", "HEAD")
-	cmd.Dir = r.Path
-	oldHead, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to get current HEAD: %s: %w", string(oldHead), err)
-	}
-	oldHeadStr := strings.TrimSpace(string(oldHead))
-
-	// Fetch from upstream
-	err = r.repo.Fetch(&git.FetchOptions{
-		RemoteName: "upstream",
-		RefSpecs:   []config.RefSpec{config.RefSpec("+refs/heads/*:refs/remotes/upstream/*")},
-		Auth:       auth,
-	})
-	if err != nil && err != git.NoErrAlreadyUpToDate {
-		return fmt.Errorf("failed to fetch from upstream: %w", err)
+	staleRefs := strings.Contains(msg, "did not send all necessary objects") ||
+		strings.Contains(msg, "does not point to a valid object") ||
+		strings.Contains(msg, "bad object refs/")
+	if !staleRefs {
+		return err
 	}
 
-	// Get the current branch name from the fork
-	currentBranchName := head.Name().Short()
+	hint := "hint: cached remote-tracking refs point at commits this clone does not have; repair with:\n" +
+		fmt.Sprintf("  git -C %s for-each-ref --format='delete %%(refname)' refs/remotes/origin | grep -v 'refs/remotes/origin/HEAD' | git -C %s update-ref --stdin\n", quoted, quoted) +
+		fmt.Sprintf("  git -C %s fetch --prune origin", quoted)
 
-	// Merge upstream changes with fast-forward only
-	cmd = exec.Command("git", "merge", "--ff-only", "upstream/"+currentBranchName)
-	cmd.Dir = r.Path
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		outputStr := string(output)
-		// Check if it's a non-fast-forward error
-		if strings.Contains(outputStr, "Not possible to fast-forward") ||
-		   strings.Contains(outputStr, "not possible to fast-forward") {
-			return fmt.Errorf("cannot fast-forward to upstream/%s: local branch has diverged from upstream. Please resolve manually (consider rebasing or merging manually)", currentBranchName)
-		}
-		return fmt.Errorf("failed to merge upstream/%s: %s: %w", currentBranchName, outputStr, err)
+	if r.unshallowFlag() != "" {
+		hint += fmt.Sprintf("\n  (shallow clone: 'git -C %s fetch --unshallow origin' also restores full history)", quoted)
 	}
 
-	// Push to origin to keep fork in sync
-	if err := r.runGitCommand("push", "origin", currentBranchName); err != nil {
-		return fmt.Errorf("failed to push to origin: %w", err)
+	return fmt.Errorf("%w\n%s", err, hint)
+}
+
+// unshallowFlag returns "--unshallow " for shallow clones and an empty string
+// otherwise.
+func (r *Repository) unshallowFlag() string {
+	out, err := gitOutput(r.Path, "rev-parse", "--is-shallow-repository")
+	if err == nil && out == "true" {
+		return "--unshallow "
+	}
+	return ""
+}
+
+// fastForward merges remote/branch, refusing anything but a fast-forward.
+func (r *Repository) fastForward(remote, branch string) error {
+	target := remote + "/" + branch
+
+	err := gitRun(r.Path, "merge", "--ff-only", target)
+	if err == nil {
+		return nil
 	}
 
-	// Get diff stats with proper width for the graph
-	termWidth := getTerminalWidth()
-	statWidth := fmt.Sprintf("--stat=%d", termWidth)
-	cmd = exec.Command("git", "diff", statWidth, "--color=always", oldHeadStr+"..HEAD")
-	cmd.Dir = r.Path
-	stats, err := cmd.CombinedOutput()
-	if err != nil {
-		// If the diff command fails, try using git show instead
-		cmd = exec.Command("git", "show", statWidth, "--color=always", "HEAD")
-		cmd.Dir = r.Path
-		stats, err = cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("failed to get diff stats: %s: %w", string(stats), err)
-		}
+	merged, ancestorErr := gitSucceeded(r.Path, "merge-base", "--is-ancestor", target, "HEAD")
+	if ancestorErr == nil && !merged {
+		return fmt.Errorf("cannot fast-forward to %s: the local branch has diverged from it. Resolve manually (consider rebasing or merging)", target)
 	}
-	r.DiffStats = string(stats)
 
+	return fmt.Errorf("failed to merge %s: %w", target, err)
+}
+
+// currentBranch returns the short name of the checked out branch.
+func currentBranch(path string) (string, error) {
+	branch, err := gitOutput(path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil || branch == "" {
+		return "", fmt.Errorf("failed to determine current branch: HEAD is detached or unborn")
+	}
+	return branch, nil
+}
+
+// diffStats returns a git diff --stat rendering of the changes between two commits.
+func (r *Repository) diffStats(oldHead string) (string, error) {
+	width := fmt.Sprintf("--stat=%d", getTerminalWidth())
+
+	colorMode := "--color=always"
+	if color.NoColor {
+		colorMode = "--color=never"
+	}
+
+	out, err := gitRawOutput(r.Path, "diff", width, colorMode, oldHead+"..HEAD")
+	if err == nil {
+		return out, nil
+	}
+
+	// Fall back to showing the commit itself, which also covers updates that
+	// only advanced HEAD without a common ancestor
+	shown, showErr := gitRawOutput(r.Path, "show", width, colorMode, "HEAD")
+	if showErr != nil {
+		return "", fmt.Errorf("failed to get diff stats: %w", err)
+	}
+
+	return shown, nil
+}
+
+// ensureGitAvailable verifies that git can be executed.
+func ensureGitAvailable() error {
+	if _, err := exec.LookPath("git"); err != nil {
+		return ErrGitNotInstalled
+	}
 	return nil
+}
+
+// credentialArgs makes GITHUB_TOKEN available to git for github.com only, as a
+// fallback behind whatever credential helper the user configured. Git applies
+// the URL-scoped helper itself, so no other host is ever offered the token.
+func credentialArgs() []string {
+	if os.Getenv("GITHUB_TOKEN") == "" {
+		return nil
+	}
+
+	const helper = `!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f`
+	return []string{"-c", "credential.https://github.com.helper=" + helper}
+}
+
+// gitCommand builds a git command that runs inside dir.
+func gitCommand(dir string, args ...string) *exec.Cmd {
+	full := append(credentialArgs(), args...)
+	cmd := exec.Command("git", full...)
+	cmd.Dir = dir
+	return cmd
+}
+
+// runGitExec executes git and returns its standard output, exit code and
+// standard error. A negative exit code reports that git could not be executed.
+func runGitExec(dir string, args ...string) (stdout string, exitCode int, stderr string) {
+	cmd := gitCommand(dir, args...)
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+
+	out, err := cmd.Output()
+	exitCode = 0
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	return string(out), exitCode, strings.TrimSpace(errBuf.String())
+}
+
+// gitOutput runs git and returns its trimmed standard output.
+func gitOutput(dir string, args ...string) (string, error) {
+	out, exitCode, stderr := runGitExec(dir, args...)
+	if exitCode != 0 {
+		return "", gitError(args, exitCode, stderr)
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// gitRawOutput runs git and returns its standard output without trimming.
+func gitRawOutput(dir string, args ...string) (string, error) {
+	out, exitCode, stderr := runGitExec(dir, args...)
+	if exitCode != 0 {
+		return "", gitError(args, exitCode, stderr)
+	}
+	return strings.TrimRight(out, "\n"), nil
+}
+
+// gitRun runs git and discards its output unless the command fails.
+func gitRun(dir string, args ...string) error {
+	_, exitCode, stderr := runGitExec(dir, args...)
+	if exitCode != 0 {
+		return gitError(args, exitCode, stderr)
+	}
+	return nil
+}
+
+// gitSucceeded reports whether git exited with status 0. Commands in git use
+// status 1 to answer "no", so that is not treated as a failure.
+func gitSucceeded(dir string, args ...string) (bool, error) {
+	_, exitCode, stderr := runGitExec(dir, args...)
+	switch exitCode {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		return false, gitError(args, exitCode, stderr)
+	}
+}
+
+// gitError builds an error that carries git's own message.
+func gitError(args []string, exitCode int, stderr string) error {
+	if stderr == "" {
+		return fmt.Errorf("git %s failed with exit code %d", strings.Join(args, " "), exitCode)
+	}
+	return errors.New(stderr)
 }

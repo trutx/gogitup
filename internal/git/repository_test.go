@@ -11,80 +11,73 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing/object"
-	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// testGitEnv isolates tests from the developer's git configuration and from
+// credential prompting.
+func testGitEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_SYSTEM", os.DevNull)
+	t.Setenv("GIT_TERMINAL_PROMPT", "0")
+}
+
+// runGitCmd runs git in dir and fails the test if it does not succeed.
+func runGitCmd(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "git %s: %s", strings.Join(args, " "), string(out))
+	return string(out)
+}
+
+// configureUser gives the repository a local commit identity.
+func configureUser(t *testing.T, dir string) {
+	t.Helper()
+	runGitCmd(t, dir, "config", "user.name", "Test User")
+	runGitCmd(t, dir, "config", "user.email", "test@example.com")
+	runGitCmd(t, dir, "config", "commit.gpgsign", "false")
+}
+
 func setupTestRepo(t *testing.T) (string, func()) {
 	t.Helper()
+	testGitEnv(t)
 
-	// Create temporary directories for origin and local repos
-	originDir, err := os.MkdirTemp("", "gogitup-test-origin-*")
+	baseDir, err := os.MkdirTemp("", "gogitup-test-*")
 	require.NoError(t, err)
-	localDir, err := os.MkdirTemp("", "gogitup-test-*")
-	require.NoError(t, err)
+
+	originDir := filepath.Join(baseDir, "origin")
+	localDir := filepath.Join(baseDir, "local")
+	require.NoError(t, os.MkdirAll(originDir, 0755))
+	require.NoError(t, os.MkdirAll(localDir, 0755))
 	t.Logf("Created test directories: origin=%s, local=%s", originDir, localDir)
 
 	// Initialize a bare repository for origin
-	_, err = git.PlainInit(originDir, true)
-	require.NoError(t, err)
+	runGitCmd(t, originDir, "init", "--bare", "--initial-branch=main")
 	t.Log("Initialized bare origin repository")
 
-	// Initialize the local repository
-	repo, err := git.PlainInit(localDir, false)
-	require.NoError(t, err)
+	// Initialize the local repository with a single commit
+	runGitCmd(t, localDir, "init", "--initial-branch=main")
+	configureUser(t, localDir)
 	t.Log("Initialized local repository")
 
-	// Create a test file and commit it
-	testFile := filepath.Join(localDir, "test.txt")
-	err = os.WriteFile(testFile, []byte("test content"), 0644)
+	err = os.WriteFile(filepath.Join(localDir, "test.txt"), []byte("test content"), 0644)
 	require.NoError(t, err)
-	t.Log("Created test file: test.txt")
-
-	// Get the worktree
-	w, err := repo.Worktree()
-	require.NoError(t, err)
-
-	// Add and commit the file
-	_, err = w.Add("test.txt")
-	require.NoError(t, err)
-	t.Log("Added test file to index")
-
-	_, err = w.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{
-			Name:  "Test User",
-			Email: "test@example.com",
-		},
-	})
-	require.NoError(t, err)
+	runGitCmd(t, localDir, "add", "test.txt")
+	runGitCmd(t, localDir, "commit", "-m", "Initial commit")
 	t.Log("Created initial commit")
 
-	// Add origin remote
-	_, err = repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{originDir},
-	})
-	require.NoError(t, err)
-	t.Log("Added origin remote")
-
-	// Push to origin
-	err = repo.Push(&git.PushOptions{})
-	require.NoError(t, err)
+	runGitCmd(t, localDir, "remote", "add", "origin", originDir)
+	runGitCmd(t, localDir, "push", "-u", "origin", "main")
 	t.Log("Pushed to origin")
 
-	// Create a cleanup function
 	cleanup := func() {
-		if err := os.RemoveAll(localDir); err != nil {
-			t.Errorf("Failed to remove local directory: %v", err)
-		}
-		err = os.RemoveAll(originDir)
-		if err != nil {
-			t.Errorf("Failed to remove origin directory: %v", err)
+		if err := os.RemoveAll(baseDir); err != nil {
+			t.Errorf("Failed to remove test directory: %v", err)
 		}
 		t.Log("Cleaned up test directories")
 	}
@@ -94,124 +87,54 @@ func setupTestRepo(t *testing.T) (string, func()) {
 
 func setupTestRepoWithRemotes(t *testing.T) (string, string, string, func()) {
 	t.Helper()
+	testGitEnv(t)
 
-	// Create temporary directories for origin, upstream, and local repos
-	originDir, err := os.MkdirTemp("", "gogitup-test-origin-*")
+	baseDir, err := os.MkdirTemp("", "gogitup-test-*")
 	require.NoError(t, err)
-	upstreamDir, err := os.MkdirTemp("", "gogitup-test-upstream-*")
-	require.NoError(t, err)
-	localDir, err := os.MkdirTemp("", "gogitup-test-local-*")
-	require.NoError(t, err)
+
+	originDir := filepath.Join(baseDir, "origin")
+	upstreamDir := filepath.Join(baseDir, "upstream")
+	localDir := filepath.Join(baseDir, "local")
+	for _, dir := range []string{originDir, upstreamDir, localDir} {
+		require.NoError(t, os.MkdirAll(dir, 0755))
+	}
 	t.Logf("Created test directories: origin=%s, upstream=%s, local=%s", originDir, upstreamDir, localDir)
 
-	// Initialize upstream repository
-	upstreamRepo, err := git.PlainInit(upstreamDir, false)
-	require.NoError(t, err)
+	// Initialize upstream repository with a single commit
+	runGitCmd(t, upstreamDir, "init", "--initial-branch=main")
+	configureUser(t, upstreamDir)
 	t.Log("Initialized upstream repository")
 
-	// Create and commit a test file in upstream
-	testFile := filepath.Join(upstreamDir, "test.txt")
-	err = os.WriteFile(testFile, []byte("test content"), 0644)
+	err = os.WriteFile(filepath.Join(upstreamDir, "test.txt"), []byte("test content"), 0644)
 	require.NoError(t, err)
-	t.Log("Created test file in upstream: test.txt")
-
-	w, err := upstreamRepo.Worktree()
-	require.NoError(t, err)
-
-	_, err = w.Add("test.txt")
-	require.NoError(t, err)
-	t.Log("Added test file to upstream index")
-
-	_, err = w.Commit("Initial commit", &git.CommitOptions{
-		Author: &object.Signature{
-			Name:  "Test User",
-			Email: "test@example.com",
-		},
-	})
-	require.NoError(t, err)
+	runGitCmd(t, upstreamDir, "add", "test.txt")
+	runGitCmd(t, upstreamDir, "commit", "-m", "Initial commit")
 	t.Log("Created initial commit in upstream")
 
 	// Initialize origin repository as bare
-	_, err = git.PlainInit(originDir, true)
-	require.NoError(t, err)
+	runGitCmd(t, originDir, "init", "--bare", "--initial-branch=main")
 	t.Log("Initialized bare origin repository")
 
-	// Set default branch name for the bare repo
-	cmd := exec.Command("git", "config", "--local", "init.defaultBranch", "main")
-	cmd.Dir = originDir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("Failed to set default branch: %s: %v", string(out), err)
-	}
-
-	// Clone upstream to local
-	repo, err := git.PlainClone(localDir, false, &git.CloneOptions{
-		URL: upstreamDir,
-	})
-	require.NoError(t, err)
+	// Clone upstream to local, then turn it into a fork of origin
+	runGitCmd(t, localDir, "clone", upstreamDir, ".")
+	configureUser(t, localDir)
 	t.Log("Cloned upstream to local")
 
-	// Set up remotes for fork workflow
-	_, err = repo.Remote("origin")
-	require.NoError(t, err)
-	t.Log("Got origin remote")
-
-	// Rename origin to upstream
-	err = repo.DeleteRemote("origin")
-	require.NoError(t, err)
-	t.Log("Deleted origin remote")
-
-	_, err = repo.CreateRemote(&config.RemoteConfig{
-		Name: "upstream",
-		URLs: []string{upstreamDir},
-	})
-	require.NoError(t, err)
-	t.Log("Added upstream remote")
-
-	// Add origin remote
-	_, err = repo.CreateRemote(&config.RemoteConfig{
-		Name: "origin",
-		URLs: []string{originDir},
-	})
-	require.NoError(t, err)
-	t.Log("Added origin remote")
-
-	// Push to origin
-	err = repo.Push(&git.PushOptions{})
-	require.NoError(t, err)
+	runGitCmd(t, localDir, "remote", "rename", "origin", "upstream")
+	runGitCmd(t, localDir, "remote", "add", "origin", originDir)
+	runGitCmd(t, localDir, "push", "-u", "origin", "main")
 	t.Log("Pushed to origin")
 
-	// Create a new commit in upstream
+	// Create a new commit in upstream so the fork is behind it
 	err = os.WriteFile(filepath.Join(upstreamDir, "upstream.txt"), []byte("upstream content"), 0644)
 	require.NoError(t, err)
-	t.Log("Created new file in upstream: upstream.txt")
-
-	w, err = upstreamRepo.Worktree()
-	require.NoError(t, err)
-
-	_, err = w.Add("upstream.txt")
-	require.NoError(t, err)
-	t.Log("Added new file to upstream index")
-
-	_, err = w.Commit("Upstream commit", &git.CommitOptions{
-		Author: &object.Signature{
-			Name:  "Test User",
-			Email: "test@example.com",
-		},
-	})
-	require.NoError(t, err)
+	runGitCmd(t, upstreamDir, "add", "upstream.txt")
+	runGitCmd(t, upstreamDir, "commit", "-m", "Upstream commit")
 	t.Log("Created new commit in upstream")
 
-	// Create a cleanup function
 	cleanup := func() {
-		if err := os.RemoveAll(originDir); err != nil {
-			t.Errorf("Failed to remove origin directory: %v", err)
-		}
-		err = os.RemoveAll(upstreamDir)
-		if err != nil {
-			t.Errorf("Failed to remove upstream directory: %v", err)
-		}
-		if err := os.RemoveAll(localDir); err != nil {
-			t.Errorf("Failed to remove local directory: %v", err)
+		if err := os.RemoveAll(baseDir); err != nil {
+			t.Errorf("Failed to remove test directory: %v", err)
 		}
 		t.Log("Cleaned up test directories")
 	}
@@ -272,10 +195,8 @@ func TestRepository_Update(t *testing.T) {
 			setupRepo: func(t *testing.T) (*Repository, func()) {
 				t.Log("Setting up clean repository test")
 				dir, cleanup := setupTestRepo(t)
-				repo, err := git.PlainOpen(dir)
-				require.NoError(t, err)
 				t.Logf("Created test repository at %s", dir)
-				return &Repository{Path: dir, repo: repo}, cleanup
+				return &Repository{Path: dir}, cleanup
 			},
 			wantErr: false,
 		},
@@ -284,10 +205,8 @@ func TestRepository_Update(t *testing.T) {
 			setupRepo: func(t *testing.T) (*Repository, func()) {
 				t.Log("Setting up repository with uncommitted changes")
 				dir, cleanup := setupTestRepo(t)
-				repo, err := git.PlainOpen(dir)
-				require.NoError(t, err)
 				t.Logf("Created test repository at %s", dir)
-				return &Repository{Path: dir, repo: repo}, cleanup
+				return &Repository{Path: dir}, cleanup
 			},
 			modifyRepo: func(t *testing.T, repo *Repository) {
 				t.Log("Creating uncommitted changes")
@@ -304,10 +223,8 @@ func TestRepository_Update(t *testing.T) {
 			setupRepo: func(t *testing.T) (*Repository, func()) {
 				t.Log("Setting up untracked files test")
 				dir, cleanup := setupTestRepo(t)
-				repo, err := git.PlainOpen(dir)
-				require.NoError(t, err)
 				t.Logf("Created test repository at %s", dir)
-				return &Repository{Path: dir, repo: repo}, cleanup
+				return &Repository{Path: dir}, cleanup
 			},
 			modifyRepo: func(t *testing.T, repo *Repository) {
 				t.Log("Creating untracked file")
@@ -323,12 +240,10 @@ func TestRepository_Update(t *testing.T) {
 			setupRepo: func(t *testing.T) (*Repository, func()) {
 				t.Log("Setting up repository with upstream remote")
 				dir, originDir, upstreamDir, cleanup := setupTestRepoWithRemotes(t)
-				repo, err := git.PlainOpen(dir)
-				require.NoError(t, err)
 				t.Logf("Created test repository at %s", dir)
 				t.Logf("Created origin repository at %s", originDir)
 				t.Logf("Created upstream repository at %s", upstreamDir)
-				return &Repository{Path: dir, repo: repo, HasUpstream: true}, cleanup
+				return &Repository{Path: dir, HasUpstream: true}, cleanup
 			},
 			wantErr: false,
 		},
@@ -361,93 +276,187 @@ func TestRepository_Update(t *testing.T) {
 	}
 }
 
-func TestRepository_GetAuth(t *testing.T) {
-	// Save original GITHUB_TOKEN and restore after test
-	origToken := os.Getenv("GITHUB_TOKEN")
-	defer func() {
-		err := os.Setenv("GITHUB_TOKEN", origToken)
-		require.NoError(t, err)
-	}()
+func TestRepository_Update_HonorsGitConfig(t *testing.T) {
+	testGitEnv(t)
+	dir, cleanup := setupTestRepo(t)
+	defer cleanup()
 
+	originURL := strings.TrimSpace(runGitCmd(t, dir, "remote", "get-url", "origin"))
+	runGitCmd(t, dir, "remote", "set-url", "origin", "https://example.invalid/origin.git")
+
+	// Only the insteadOf rule below can resolve that URL, so the update fails
+	// unless gogitup honours the user's git configuration.
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	rule := fmt.Sprintf("[url \"%s\"]\n\tinsteadOf = https://example.invalid/origin.git\n", originURL)
+	require.NoError(t, os.WriteFile(globalConfig, []byte(rule), 0644))
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
+
+	// Advance the origin so the update has something to fast-forward
+	pushDir := filepath.Join(t.TempDir(), "pusher")
+	runGitCmd(t, filepath.Dir(pushDir), "clone", originURL, pushDir)
+	configureUser(t, pushDir)
+	require.NoError(t, os.WriteFile(filepath.Join(pushDir, "new.txt"), []byte("new"), 0644))
+	runGitCmd(t, pushDir, "add", "new.txt")
+	runGitCmd(t, pushDir, "commit", "-m", "New commit")
+	runGitCmd(t, pushDir, "push", "origin", "main")
+
+	r := &Repository{Path: dir}
+	require.NoError(t, r.Update())
+
+	assert.Equal(t,
+		strings.TrimSpace(runGitCmd(t, originURL, "rev-parse", "HEAD")),
+		strings.TrimSpace(runGitCmd(t, dir, "rev-parse", "HEAD")),
+	)
+	assert.Equal(t, "new.txt", strings.TrimSpace(runGitCmd(t, dir, "show", "--name-only", "--pretty=format:", "HEAD")))
+	assert.NotEmpty(t, r.DiffStats)
+}
+
+func TestRepository_Update_DivergedBranch(t *testing.T) {
+	testGitEnv(t)
+	dir, cleanup := setupTestRepo(t)
+	defer cleanup()
+
+	// A local commit origin does not have
+	configureUser(t, dir)
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "local.txt"), []byte("local"), 0644))
+	runGitCmd(t, dir, "add", "local.txt")
+	runGitCmd(t, dir, "commit", "-m", "Local commit")
+
+	// And an unrelated commit in origin
+	originURL := strings.TrimSpace(runGitCmd(t, dir, "remote", "get-url", "origin"))
+	pushDir := filepath.Join(t.TempDir(), "pusher")
+	runGitCmd(t, filepath.Dir(pushDir), "clone", originURL, pushDir)
+	configureUser(t, pushDir)
+	require.NoError(t, os.WriteFile(filepath.Join(pushDir, "remote.txt"), []byte("remote"), 0644))
+	runGitCmd(t, pushDir, "add", "remote.txt")
+	runGitCmd(t, pushDir, "commit", "-m", "Remote commit")
+	runGitCmd(t, pushDir, "push", "origin", "main")
+
+	err := (&Repository{Path: dir}).Update()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "diverged")
+}
+
+func TestRepository_WithFetchHint(t *testing.T) {
 	tests := []struct {
-		name     string
-		setup    func() *Repository
-		wantAuth bool
+		name    string
+		errText string
+		want    bool
 	}{
 		{
-			name: "github repository with token",
-			setup: func() *Repository {
-				err := os.Setenv("GITHUB_TOKEN", "test-token")
-				require.NoError(t, err)
-				tmpDir, err := os.MkdirTemp("", "gogitup-test-*")
-				require.NoError(t, err)
-				gitRepo, err := git.PlainInit(tmpDir, false)
-				require.NoError(t, err)
-				_, err = gitRepo.CreateRemote(&config.RemoteConfig{
-					Name: "origin",
-					URLs: []string{"https://github.com/user/repo.git"},
-				})
-				require.NoError(t, err)
-				return &Repository{Path: tmpDir, repo: gitRepo}
-			},
-			wantAuth: true,
+			name:    "bad object from a dangling ref",
+			errText: "fatal: bad object refs/remotes/origin/gtabularize\nerror: https://github.com/godlygeek/tabular.git did not send all necessary objects",
+			want:    true,
 		},
 		{
-			name: "github repository without token",
-			setup: func() *Repository {
-				err := os.Unsetenv("GITHUB_TOKEN")
-				require.NoError(t, err)
-				tmpDir, err := os.MkdirTemp("", "gogitup-test-*")
-				require.NoError(t, err)
-				gitRepo, err := git.PlainInit(tmpDir, false)
-				require.NoError(t, err)
-				_, err = gitRepo.CreateRemote(&config.RemoteConfig{
-					Name: "origin",
-					URLs: []string{"https://github.com/user/repo.git"},
-				})
-				require.NoError(t, err)
-				return &Repository{Path: tmpDir, repo: gitRepo}
-			},
-			wantAuth: false,
+			name:    "ref without a valid object",
+			errText: "error: refs/remotes/origin/v1.0.x does not point to a valid object!",
+			want:    true,
 		},
 		{
-			name: "non-github repository",
-			setup: func() *Repository {
-				tmpDir, err := os.MkdirTemp("", "gogitup-test-*")
-				require.NoError(t, err)
-				gitRepo, err := git.PlainInit(tmpDir, false)
-				require.NoError(t, err)
-				_, err = gitRepo.CreateRemote(&config.RemoteConfig{
-					Name: "origin",
-					URLs: []string{"https://gitlab.com/user/repo.git"},
-				})
-				require.NoError(t, err)
-				return &Repository{Path: tmpDir, repo: gitRepo}
-			},
-			wantAuth: false,
+			name:    "incomplete object store",
+			errText: "error: Could not read 60f25648814f0695eeb6c1040d97adca93c4e0bb\nfatal: unresolved deltas left after unpacking\nfatal: unpack-objects failed",
+			want:    true,
+		},
+		{
+			name:    "unrelated fetch failure",
+			errText: "fatal: unable to access 'https://127.0.0.1:1/org/repo.git/': Couldn't connect to server",
+			want:    false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			repo := tt.setup()
-			defer func() {
-				_ = os.RemoveAll(repo.Path)
-			}()
-			auth := repo.getAuth()
-			if tt.wantAuth {
-				assert.NotNil(t, auth)
-				if basicAuth, ok := auth.(*githttp.BasicAuth); ok {
-					assert.Equal(t, "git", basicAuth.Username)
-					assert.Equal(t, "test-token", basicAuth.Password)
+			r := &Repository{Path: "/repo"}
+			got := r.withFetchHint(fmt.Errorf("%s", tt.errText))
+
+			assert.Contains(t, got.Error(), tt.errText)
+			if tt.want {
+				assert.Contains(t, got.Error(), "repair with")
+				if strings.Contains(tt.errText, "unresolved deltas") {
+					assert.Contains(t, got.Error(), "--refetch")
 				} else {
-					t.Error("Expected BasicAuth type")
+					assert.Contains(t, got.Error(), "update-ref --stdin")
 				}
 			} else {
-				assert.Nil(t, auth)
+				assert.Equal(t, tt.errText, got.Error())
 			}
 		})
 	}
+}
+
+// TestRepository_Update_FetchHintIsRunnable checks that the repair commands in
+// the hint work as printed, including on a clone that has an origin/HEAD symref.
+func TestRepository_Update_FetchHintIsRunnable(t *testing.T) {
+	testGitEnv(t)
+	baseDir := t.TempDir()
+
+	originDir := filepath.Join(baseDir, "origin.git")
+	require.NoError(t, os.MkdirAll(originDir, 0755))
+	runGitCmd(t, originDir, "init", "--bare", "--initial-branch=main")
+
+	seedDir := filepath.Join(baseDir, "seed")
+	runGitCmd(t, baseDir, "clone", originDir, seedDir)
+	configureUser(t, seedDir)
+	require.NoError(t, os.WriteFile(filepath.Join(seedDir, "a.txt"), []byte("a"), 0644))
+	runGitCmd(t, seedDir, "add", "a.txt")
+	runGitCmd(t, seedDir, "commit", "-m", "one")
+	runGitCmd(t, seedDir, "push", "origin", "main")
+	runGitCmd(t, seedDir, "checkout", "-b", "side")
+	require.NoError(t, os.WriteFile(filepath.Join(seedDir, "s.txt"), []byte("s"), 0644))
+	runGitCmd(t, seedDir, "add", "s.txt")
+	runGitCmd(t, seedDir, "commit", "-m", "side")
+	runGitCmd(t, seedDir, "push", "origin", "side")
+
+	// A shallow clone with an origin/HEAD symref, plus a remote-tracking ref
+	// pointing at a commit the clone never fetched
+	workDir := filepath.Join(baseDir, "work")
+	runGitCmd(t, baseDir, "clone", "--depth", "1", "--single-branch", "--branch", "main", "file://"+originDir, workDir)
+	configureUser(t, workDir)
+	runGitCmd(t, workDir, "remote", "set-head", "origin", "main")
+
+	sideHash := strings.TrimSpace(runGitCmd(t, originDir, "rev-parse", "side"))
+	refPath := filepath.Join(workDir, ".git", "refs", "remotes", "origin", "side")
+	require.NoError(t, os.MkdirAll(filepath.Dir(refPath), 0755))
+	require.NoError(t, os.WriteFile(refPath, []byte(sideHash+"\n"), 0644))
+
+	r := &Repository{Path: workDir}
+	err := r.Update()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "repair with")
+
+	// Run every command the hint prints, as printed
+	commands := 0
+	for _, line := range strings.Split(err.Error(), "\n") {
+		if !strings.HasPrefix(line, "  git -C ") {
+			continue
+		}
+		cmd := exec.Command("sh", "-c", strings.TrimSpace(line))
+		out, cmdErr := cmd.CombinedOutput()
+		require.NoError(t, cmdErr, "hint command failed: %s: %s", line, string(out))
+		commands++
+	}
+	require.Greater(t, commands, 0, "expected the hint to contain git commands")
+
+	// After running them the repository must update normally
+	require.NoError(t, (&Repository{Path: workDir}).Update())
+}
+
+func TestCredentialArgs(t *testing.T) {
+	t.Run("no token", func(t *testing.T) {
+		t.Setenv("GITHUB_TOKEN", "")
+		assert.Empty(t, credentialArgs())
+	})
+
+	t.Run("token set", func(t *testing.T) {
+		t.Setenv("GITHUB_TOKEN", "test-token")
+		args := credentialArgs()
+		require.Len(t, args, 2)
+		assert.Equal(t, "-c", args[0])
+		assert.Equal(t, `credential.https://github.com.helper=!f() { echo username=x-access-token; echo "password=$GITHUB_TOKEN"; }; f`, args[1])
+		// The token is expanded by git at runtime, never baked into argv.
+		assert.NotContains(t, strings.Join(args, " "), "test-token")
+	})
 }
 
 func TestRepository_Update_Errors(t *testing.T) {
@@ -459,58 +468,33 @@ func TestRepository_Update_Errors(t *testing.T) {
 		{
 			name: "invalid worktree",
 			setup: func(t *testing.T) (*Repository, func()) {
-				dir, err := os.MkdirTemp("", "gogitup-test-invalid-*")
-				require.NoError(t, err)
-				repo, err := git.PlainInit(dir, false)
-				require.NoError(t, err)
-				// Create an invalid repository state
-				err = os.RemoveAll(filepath.Join(dir, ".git", "HEAD"))
-				require.NoError(t, err)
-				return &Repository{Path: dir, repo: repo}, func() {
-					if err := os.RemoveAll(dir); err != nil {
-						t.Errorf("Failed to remove directory: %v", err)
-					}
-				}
+				testGitEnv(t)
+				dir := t.TempDir()
+				runGitCmd(t, dir, "init", "--initial-branch=main")
+				// Break the repository by removing HEAD
+				require.NoError(t, os.Remove(filepath.Join(dir, ".git", "HEAD")))
+				return &Repository{Path: dir}, func() {}
 			},
-			expectError: "reference not found",
+			expectError: "not a git repository",
 		},
 		{
 			name: "uncommitted changes",
 			setup: func(t *testing.T) (*Repository, func()) {
 				dir, cleanup := setupTestRepo(t)
-				repo, err := git.PlainOpen(dir)
+				err := os.WriteFile(filepath.Join(dir, "test.txt"), []byte("modified content"), 0644)
 				require.NoError(t, err)
-				// Modify tracked file
-				err = os.WriteFile(filepath.Join(dir, "test.txt"), []byte("modified content"), 0644)
-				require.NoError(t, err)
-				return &Repository{Path: dir, repo: repo}, cleanup
+				return &Repository{Path: dir}, cleanup
 			},
 			expectError: "worktree contains uncommitted changes to tracked files",
 		},
 		{
-			name: "authentication required",
+			name: "unreachable remote",
 			setup: func(t *testing.T) (*Repository, func()) {
 				dir, cleanup := setupTestRepo(t)
-				repo, err := git.PlainOpen(dir)
-				require.NoError(t, err)
-				// Remove any existing remotes
-				remotes, err := repo.Remotes()
-				require.NoError(t, err)
-				for _, r := range remotes {
-					err = repo.DeleteRemote(r.Config().Name)
-					require.NoError(t, err)
-				}
-				// Add GitHub remote
-				_, err = repo.CreateRemote(&config.RemoteConfig{
-					Name: "origin",
-					URLs: []string{"https://github.com/user/repo.git"},
-				})
-				require.NoError(t, err)
-				err = os.Unsetenv("GITHUB_TOKEN")
-				require.NoError(t, err)
-				return &Repository{Path: dir, repo: repo}, cleanup
+				runGitCmd(t, dir, "remote", "set-url", "origin", "https://127.0.0.1:1/user/repo.git")
+				return &Repository{Path: dir}, cleanup
 			},
-			expectError: "authentication required",
+			expectError: "failed to fetch from origin",
 		},
 	}
 
@@ -661,7 +645,6 @@ func TestLoadRepositories(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 1, len(repos))
 	assert.Equal(t, repoDir, repos[0].Path)
-	assert.NotNil(t, repos[0].repo)
 
 	// Test loading invalid repository path
 	invalidPath := filepath.Join(tmpDir, "invalid")
@@ -829,20 +812,17 @@ func TestRepository_isLFSRepository(t *testing.T) {
 			}()
 
 			// Initialize git repository
-			repo, err := git.PlainInit(dir, false)
-			require.NoError(t, err)
+			testGitEnv(t)
+			runGitCmd(t, dir, "init", "--initial-branch=main")
 
 			// Create .gitattributes file if content is provided
 			if tt.gitattributes != "" {
-				err = os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte(tt.gitattributes), 0644)
+				err := os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte(tt.gitattributes), 0644)
 				require.NoError(t, err)
 			}
 
 			// Create repository instance
-			r := &Repository{
-				Path: dir,
-				repo: repo,
-			}
+			r := &Repository{Path: dir}
 
 			// Test LFS detection
 			assert.Equal(t, tt.expectUsesLFS, r.isLFSRepository())
@@ -1273,12 +1253,7 @@ func TestRepository_UpdateLFS(t *testing.T) {
 			require.NoError(t, err)
 
 			// Create repository instance
-			repo, err := git.PlainOpen(dir)
-			require.NoError(t, err)
-			r := &Repository{
-				Path: dir,
-				repo: repo,
-			}
+			r := &Repository{Path: dir}
 
 			// Modify repository if needed
 			if tt.modifyRepo != nil {

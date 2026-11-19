@@ -68,8 +68,9 @@ var updateCmd = &cobra.Command{
 By default, a scan for new repositories runs automatically before updating.
 Disable auto-scan with --no-scan or set auto_scan: false in the config file.
 
-For each repository, it will fetch and pull changes from origin, and for
-forks it will rebase onto upstream/master.
+For each repository it fetches from origin (and from upstream for forks),
+fast-forwards the current branch, and pushes forks back to origin.
+Repositories with uncommitted changes to tracked files are skipped.
 
 Use the -s or --stat flag to show git diff statistics for updated repositories.`,
 	SilenceErrors: true,

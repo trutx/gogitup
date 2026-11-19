@@ -7,11 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
@@ -173,42 +169,9 @@ func TestScanCommand_RepositoryDiscovery(t *testing.T) {
 				repoDirs = append(repoDirs, repoDir)
 
 				if tt.setupRepos {
-					repo, err := git.PlainInit(repoDir, false)
-					require.NoError(t, err)
-
-					// Create a test file and commit it
-					testFile := filepath.Join(repoDir, "test.txt")
-					err = os.WriteFile(testFile, []byte("test content"), 0644)
-					require.NoError(t, err)
-
-					w, err := repo.Worktree()
-					require.NoError(t, err)
-
-					_, err = w.Add("test.txt")
-					require.NoError(t, err)
-
-					_, err = w.Commit("Initial commit", &git.CommitOptions{
-						Author: &object.Signature{
-							Name:  "Test User",
-							Email: "test@example.com",
-							When:  time.Now(),
-						},
-					})
-					require.NoError(t, err)
-
-					// Create a bare clone to serve as the remote
-					remoteDir := filepath.Join(tmpDir, dir+"_remote.git")
-					_, err = git.PlainClone(remoteDir, true, &git.CloneOptions{
-						URL: repoDir,
-					})
-					require.NoError(t, err)
-
-					// Add the remote to the original repository
-					_, err = repo.CreateRemote(&config.RemoteConfig{
-						Name: "origin",
-						URLs: []string{remoteDir},
-					})
-					require.NoError(t, err)
+					testGitEnv(t)
+					initCommittedRepo(t, repoDir)
+					addBareRemote(t, repoDir)
 				}
 			}
 
@@ -308,31 +271,10 @@ func TestScanCommand_Output(t *testing.T) {
 			// Create test repository if needed
 			if tt.setupRepos {
 				repoDir := filepath.Join(tmpDir, "repo")
-				err := os.MkdirAll(repoDir, 0755)
-				require.NoError(t, err)
+				require.NoError(t, os.MkdirAll(repoDir, 0755))
 
-				repo, err := git.PlainInit(repoDir, false)
-				require.NoError(t, err)
-
-				// Create a test file and commit it
-				testFile := filepath.Join(repoDir, "test.txt")
-				err = os.WriteFile(testFile, []byte("test content"), 0644)
-				require.NoError(t, err)
-
-				w, err := repo.Worktree()
-				require.NoError(t, err)
-
-				_, err = w.Add("test.txt")
-				require.NoError(t, err)
-
-				_, err = w.Commit("Initial commit", &git.CommitOptions{
-					Author: &object.Signature{
-						Name:  "Test User",
-						Email: "test@example.com",
-						When:  time.Now(),
-					},
-				})
-				require.NoError(t, err)
+				testGitEnv(t)
+				initCommittedRepo(t, repoDir)
 			}
 
 			// Create test config file
